@@ -48,7 +48,9 @@ jobs:
       - name: Install pinned cargo-audit
         run: |
           cargo install cargo-audit --version "$CARGO_AUDIT_VERSION" --locked
-          test "$(cargo audit --version)" = "cargo-audit $CARGO_AUDIT_VERSION"
+          installed_audit_version="$(cargo audit --version)"
+          echo "$installed_audit_version"
+          test "${installed_audit_version##* }" = "$CARGO_AUDIT_VERSION"
 
       - name: Check out repository
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
