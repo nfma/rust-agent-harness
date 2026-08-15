@@ -15,8 +15,7 @@ on:
     tags:
       - "v*.*.*"
 
-permissions:
-  contents: read
+permissions: {}
 
 env:
   RUST_TOOLCHAIN: "1.85.0"
@@ -31,6 +30,8 @@ jobs:
     name: Release gate
     runs-on: ubuntu-24.04
     timeout-minutes: 15
+    permissions:
+      contents: read
     outputs:
       manifest_version: ${{ steps.version.outputs.manifest_version }}
     steps:
@@ -38,6 +39,7 @@ jobs:
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           fetch-depth: ${{ github.ref_type == 'tag' && '0' || '1' }}
+          persist-credentials: false
 
       - name: Install Rust
         run: |
@@ -82,9 +84,13 @@ jobs:
     needs: release_gate
     runs-on: macos-15
     timeout-minutes: 15
+    permissions:
+      contents: read
     steps:
       - name: Check out repository
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
 
       - name: Install Rust
         run: |
@@ -105,9 +111,13 @@ jobs:
     needs: release_gate
     runs-on: macos-15
     timeout-minutes: 15
+    permissions:
+      contents: read
     steps:
       - name: Check out repository
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
 
       - name: Install Rust
         run: |
@@ -128,9 +138,13 @@ jobs:
       - stable_quality
     runs-on: macos-15
     timeout-minutes: 15
+    permissions:
+      contents: read
     steps:
       - name: Check out repository
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
 
       - name: Install Rust
         run: |
