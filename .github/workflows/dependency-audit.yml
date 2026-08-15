@@ -1,0 +1,82 @@
+name: Dependency audit
+
+# Dependabot alerts are computed by GitHub against the *default branch*, not
+# against a pull request head, so running this check on a pull request would
+# report on `trunk` rather than on the change under review. It therefore runs on
+# pushes to `trunk` and on a weekly schedule, where it is measuring the thing it
+# actually describes.
+#
+# This repository is Cargo-only, so there is no `npm audit` counterpart here.
+# Dependabot's alert feed is ecosystem-agnostic and covers the Cargo dependency
+# graph. If a lockfile-resolving second source is wanted later, `cargo audit`
+# against `Cargo.lock` is the analogue of the `npm audit` job used in the
+# JavaScript repositories.
+#
+# The alert check needs a token the workflow does not get by default. The Actions
+# `GITHUB_TOKEN` cannot read the Dependabot alerts API: it returns HTTP 403
+# `Resource not accessible by integration`, both with the default
+# `contents: read` and with `security-events: read` added. That permission covers
+# code scanning, not Dependabot alerts, and the workflow `permissions:` block
+# exposes no key that does. Set a repository Actions secret
+# `DEPENDABOT_ALERTS_TOKEN` carrying Dependabot-alerts read access to activate
+# this check; until then the job reports that it did not run rather than
+# reporting a clean result.
+
+on:
+  push:
+    branches: [trunk]
+  schedule:
+    - cron: "30 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  dependabot-alerts:
+    name: GitHub Dependabot alerts
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Require no open Dependabot alerts
+        env:
+          GH_TOKEN: ${{ secrets.DEPENDABOT_ALERTS_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          # Not configured. Say so loudly, so this can never be mistaken for
+          # "no alerts found".
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "::warning::Dependabot alerts were NOT checked: repository secret DEPENDABOT_ALERTS_TOKEN is not set. Add a token with Dependabot-alerts read access to enable this check."
+            echo "Dependabot alert check did not run: DEPENDABOT_ALERTS_TOKEN is not configured."
+            echo "This is not a clean result — it is an unchecked one."
+            exit 0
+          fi
+
+          # Configured but unusable is a real failure: fail closed rather than
+          # let a broken token look like a clean tree.
+          if ! alerts=$(gh api \
+            "repos/${GITHUB_REPOSITORY}/dependabot/alerts?state=open&per_page=100" \
+            2>&1); then
+            echo "Could not read Dependabot alerts:" >&2
+            echo "$alerts" >&2
+            echo >&2
+            echo "DEPENDABOT_ALERTS_TOKEN is set but cannot read the alerts API;" >&2
+            echo "it most likely lacks Dependabot-alerts read access." >&2
+            exit 1
+          fi
+
+          count=$(printf '%s' "$alerts" | jq 'length')
+          if [ "$count" -eq 0 ]; then
+            echo "No open Dependabot alerts."
+            exit 0
+          fi
+
+          echo "$count open Dependabot alert(s):" >&2
+          printf '%s' "$alerts" | jq -r '.[]
+            | "  \(.security_advisory.severity)\t\(.dependency.package.name)\t\(.dependency.scope)\tfixed in \(.security_vulnerability.first_patched_version.identifier // "no patch available")"' >&2
+          exit 1
