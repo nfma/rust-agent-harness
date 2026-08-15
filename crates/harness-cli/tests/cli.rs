@@ -63,6 +63,34 @@ fn invalid_command_prints_a_diagnostic() {
 }
 
 #[test]
+fn invalid_command_escapes_control_characters() {
+    let output = run(&["oops\nerror: forged\u{1b}[31m"]);
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr),
+        "error: unexpected argument 'oops\\nerror: forged\\u{1b}[31m'\n\nUsage: harness [OPTIONS]\n\nFor more information, try '--help'.\n"
+    );
+}
+
+#[test]
+fn invalid_command_truncates_oversized_arguments() {
+    let argument = "x".repeat(300);
+    let output = run(&[&argument]);
+    let displayed_argument = format!("{}…", "x".repeat(256));
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr),
+        format!(
+            "error: unexpected argument '{displayed_argument}'\n\nUsage: harness [OPTIONS]\n\nFor more information, try '--help'.\n"
+        )
+    );
+}
+
+#[test]
 fn help_and_version_flags_are_terminal() {
     let help = run(&["--help", "extra"]);
     assert!(help.status.success());

@@ -17,3 +17,7 @@ cargo fmt --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
+
+## License
+
+Licensed under the MIT License. See [LICENSE](LICENSE).
