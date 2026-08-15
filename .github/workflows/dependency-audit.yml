@@ -1,16 +1,8 @@
 name: Dependency audit
 
-# Dependabot alerts are computed by GitHub against the *default branch*, not
-# against a pull request head, so running this check on a pull request would
-# report on `trunk` rather than on the change under review. It therefore runs on
-# pushes to `trunk` and on a weekly schedule, where it is measuring the thing it
-# actually describes.
-#
-# This repository is Cargo-only, so there is no `npm audit` counterpart here.
-# Dependabot's alert feed is ecosystem-agnostic and covers the Cargo dependency
-# graph. If a lockfile-resolving second source is wanted later, `cargo audit`
-# against `Cargo.lock` is the analogue of the `npm audit` job used in the
-# JavaScript repositories.
+# `cargo audit` checks the pull request's committed lockfile against RustSec.
+# Dependabot alerts describe the default branch instead, so that check runs only
+# on pushes to `trunk`, manual dispatches, and the weekly schedule.
 #
 # The alert check needs a token the workflow does not get by default. The Actions
 # `GITHUB_TOKEN` cannot read the Dependabot alerts API: it returns HTTP 403
@@ -23,22 +15,54 @@ name: Dependency audit
 # reporting a clean result.
 
 on:
+  pull_request:
+    branches: [trunk]
   push:
     branches: [trunk]
   schedule:
     - cron: "30 6 * * 1"
   workflow_dispatch:
 
-permissions:
-  contents: read
+permissions: {}
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
+  cargo-audit:
+    name: RustSec cargo audit
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    env:
+      CARGO_AUDIT_TOOLCHAIN: "1.88.0"
+      CARGO_AUDIT_VERSION: "0.22.2"
+    steps:
+      - name: Install Rust
+        run: |
+          rustup toolchain install "$CARGO_AUDIT_TOOLCHAIN" --profile minimal --no-self-update
+          rustup default "$CARGO_AUDIT_TOOLCHAIN"
+
+      - name: Install pinned cargo-audit
+        run: |
+          cargo install cargo-audit --version "$CARGO_AUDIT_VERSION" --locked
+          test "$(cargo audit --version)" = "cargo-audit $CARGO_AUDIT_VERSION"
+
+      - name: Check out repository
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - name: Audit Cargo.lock against RustSec
+        run: |
+          test -f Cargo.lock
+          cargo audit --file Cargo.lock --deny warnings
+
   dependabot-alerts:
     name: GitHub Dependabot alerts
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
