@@ -1,21 +1,32 @@
 # Rust agent harness
 
-This repository currently contains the runnable CLI skeleton only. Authentication, providers, persistence, MCP, tools, skills, and the TUI are intentionally deferred.
+This repository contains a runnable CLI and native OpenAI Codex account login on macOS. Model requests, the remaining credential lifecycle, MCP, tools, skills, and the TUI are intentionally deferred.
 
 It requires Rust 1.85 or newer.
 
-Run the demo:
+Inspect the CLI:
 
 ```sh
 cargo run -p harness-cli -- --version
 ```
 
-Verify the skeleton:
+Connect an OpenAI Codex account on macOS:
+
+```sh
+cargo run -p harness-cli -- auth login openai-codex
+```
+
+The command opens OpenAI's browser authorization flow and prints the same one-time URL as a fallback. On success, it stores a versioned credential under the harness-owned `rust-agent-harness` / `openai-codex:default` macOS Keychain coordinates. It does not read or modify Codex CLI credentials.
+
+This command is also the opt-in live smoke test: it requires a browser, a ChatGPT subscription with Codex access, and Keychain approval. Default tests use local fake endpoints and an in-memory credential store; they never start live OAuth or access the real Keychain.
+
+Verify the workspace:
 
 ```sh
 cargo fmt --check
 cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --locked
+cargo build --workspace --locked
 ```
 
 ## SonarQube Cloud

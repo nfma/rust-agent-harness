@@ -6,6 +6,9 @@ license.workspace = true
 rust-version.workspace = true
 publish = false
 
+[dependencies]
+harness-openai-codex-auth = { path = "../openai-codex-auth" }
+
 [[bin]]
 name = "harness"
 path = "src/main.rs"
