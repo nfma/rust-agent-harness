@@ -1,23 +1,42 @@
+#[cfg(any(target_os = "macos", test))]
 mod callback;
+#[cfg(any(target_os = "macos", test))]
 mod credential;
+#[cfg(any(target_os = "macos", test))]
 mod keychain;
+#[cfg(any(target_os = "macos", test))]
 mod oauth;
+#[cfg(any(target_os = "macos", test))]
 mod pkce;
 
 use std::fmt;
+#[cfg(any(target_os = "macos", test))]
 use std::time::Duration;
 
+#[cfg(any(target_os = "macos", test))]
 use callback::{CallbackError, CallbackListener, CallbackOutcome};
-use credential::{Clock, CredentialRecord, SystemClock};
+#[cfg(target_os = "macos")]
+use credential::SystemClock;
+#[cfg(any(target_os = "macos", test))]
+use credential::{Clock, CredentialRecord};
+#[cfg(any(target_os = "macos", test))]
 use keychain::CredentialStore;
+#[cfg(any(target_os = "macos", test))]
 use oauth::{ExchangeConfig, ExchangeError};
+#[cfg(any(target_os = "macos", test))]
 use pkce::AuthSecrets;
+#[cfg(any(target_os = "macos", test))]
 use url::Url;
 
+#[cfg(any(target_os = "macos", test))]
 const LOGIN_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+#[cfg(any(target_os = "macos", test))]
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+#[cfg(any(target_os = "macos", test))]
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+#[cfg(any(target_os = "macos", test))]
 const TOKEN_RESPONSE_LIMIT: usize = 64 * 1024;
+#[cfg(any(target_os = "macos", test))]
 const REDIRECT_PORTS: [u16; 2] = [1455, 1457];
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -129,6 +148,7 @@ pub fn login(progress: impl FnMut(LoginProgress)) -> Result<ConnectedAccount, Lo
     }
 }
 
+#[cfg(any(target_os = "macos", test))]
 struct LoginConfig {
     authorization_endpoint: Url,
     exchange: ExchangeConfig,
@@ -136,6 +156,7 @@ struct LoginConfig {
     login_timeout: Duration,
 }
 
+#[cfg(any(target_os = "macos", test))]
 impl LoginConfig {
     fn production() -> Self {
         Self {
@@ -154,18 +175,22 @@ impl LoginConfig {
     }
 }
 
+#[cfg(any(target_os = "macos", test))]
 trait BrowserLauncher {
     fn open(&mut self, url: &str) -> Result<(), ()>;
 }
 
+#[cfg(target_os = "macos")]
 struct SystemBrowser;
 
+#[cfg(target_os = "macos")]
 impl BrowserLauncher for SystemBrowser {
     fn open(&mut self, url: &str) -> Result<(), ()> {
         webbrowser::open(url).map(|_| ()).map_err(|_| ())
     }
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn login_with(
     config: &LoginConfig,
     browser: &mut dyn BrowserLauncher,
@@ -216,6 +241,7 @@ fn login_with(
     Ok(account)
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn map_callback_error(error: CallbackError) -> LoginError {
     match error {
         CallbackError::PortsUnavailable => LoginError::CallbackPortsUnavailable,
@@ -224,6 +250,7 @@ fn map_callback_error(error: CallbackError) -> LoginError {
     }
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn map_exchange_error(error: ExchangeError) -> LoginError {
     match error {
         ExchangeError::Unavailable => LoginError::TokenExchangeUnavailable,

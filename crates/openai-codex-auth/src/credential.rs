@@ -1,3 +1,4 @@
+#[cfg(target_os = "macos")]
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -13,8 +14,10 @@ pub(crate) trait Clock {
     fn unix_seconds(&self) -> u64;
 }
 
+#[cfg(target_os = "macos")]
 pub(crate) struct SystemClock;
 
+#[cfg(target_os = "macos")]
 impl Clock for SystemClock {
     fn unix_seconds(&self) -> u64 {
         SystemTime::now()
