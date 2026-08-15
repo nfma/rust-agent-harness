@@ -14,15 +14,15 @@ Verify the skeleton:
 
 ```sh
 cargo fmt --check
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo test --workspace --locked
 ```
 
 ## Releases
 
-Pull requests and pushes to `trunk` run the quality gate and build macOS archives for Apple Silicon and Intel. After merging a version change to `trunk`, push a matching tag such as `v0.1.0` to publish both archives and `SHA256SUMS` as a GitHub Release.
+Pull requests and pushes to `trunk` run the quality gate and build a macOS archive for Apple Silicon. A manual workflow run assembles the archive and `SHA256SUMS` without publishing by default. After merging a version change to `trunk`, push a matching tag such as `v0.1.0` to publish them as a GitHub Release.
 
-The tag version must match the Cargo package version, and the tagged commit must belong to `trunk`. Release binaries are not currently signed or notarized.
+The tag version must match the Cargo package version, and the tagged commit must belong to `trunk`. CI verifies and builds releases with Rust 1.85.0. Release binaries are not currently signed or notarized.
 
 ## License
 
