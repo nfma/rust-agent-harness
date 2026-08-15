@@ -13,7 +13,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  CARGO_LLVM_COV_VERSION: "0.8.7"
+  CARGO_LLVM_COV_VERSION: "0.6.21"
   RUST_TOOLCHAIN: "1.85.0"
 
 jobs:
