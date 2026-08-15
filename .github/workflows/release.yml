@@ -1,0 +1,242 @@
+name: Build and release
+
+on:
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Publish when the selected ref is a tag; leave disabled for a smoke test
+        required: false
+        default: false
+        type: boolean
+  pull_request:
+  push:
+    branches:
+      - trunk
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: read
+
+env:
+  RUST_TOOLCHAIN: "1.85.0"
+  TARGET: aarch64-apple-darwin
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref_type != 'tag' }}
+
+jobs:
+  release_gate:
+    name: Release gate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    outputs:
+      manifest_version: ${{ steps.version.outputs.manifest_version }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: ${{ github.ref_type == 'tag' && '0' || '1' }}
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --no-self-update
+          rustup default "$RUST_TOOLCHAIN"
+
+      - name: Read manifest version
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          manifest_version="$(cargo metadata --locked --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "harness-cli") | .version')"
+          if [[ -z "$manifest_version" || "$manifest_version" == "null" ]]; then
+            echo "Could not read the harness-cli version" >&2
+            exit 1
+          fi
+
+          echo "manifest_version=$manifest_version" >> "$GITHUB_OUTPUT"
+
+      - name: Validate release tag
+        if: github.ref_type == 'tag'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          release_version="${GITHUB_REF_NAME#v}"
+          if [[ "$release_version" != "$MANIFEST_VERSION" ]]; then
+            echo "Tag version $release_version does not match Cargo version $MANIFEST_VERSION" >&2
+            exit 1
+          fi
+
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/trunk; then
+            echo "Release tag must point to a commit on trunk" >&2
+            exit 1
+          fi
+        env:
+          MANIFEST_VERSION: ${{ steps.version.outputs.manifest_version }}
+
+  quality:
+    name: Quality gate
+    needs: release_gate
+    runs-on: macos-15
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --component clippy,rustfmt --no-self-update
+          rustup default "$RUST_TOOLCHAIN"
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+      - name: Run Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Run tests
+        run: cargo test --workspace --locked
+
+  stable_quality:
+    name: Current stable compatibility
+    needs: release_gate
+    runs-on: macos-15
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy --no-self-update
+          rustup default stable
+
+      - name: Run Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Run tests
+        run: cargo test --workspace --locked
+
+  build:
+    name: Build aarch64-apple-darwin
+    needs:
+      - release_gate
+      - quality
+      - stable_quality
+    runs-on: macos-15
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --no-self-update
+          rustup default "$RUST_TOOLCHAIN"
+          rustup target add "$TARGET" --toolchain "$RUST_TOOLCHAIN"
+
+      - name: Build release binary
+        run: cargo build --release --locked --target "$TARGET" -p harness-cli
+
+      - name: Package binary
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
+            archive_version="$MANIFEST_VERSION"
+          else
+            archive_version="${MANIFEST_VERSION}+${ARCHIVE_SHA::7}"
+          fi
+
+          archive_stem="harness-${archive_version}-${TARGET}"
+          package_directory="dist/${archive_stem}"
+          mkdir -p "$package_directory"
+          cp "target/${TARGET}/release/harness" LICENSE README.md "$package_directory/"
+          tar -czf "dist/${archive_stem}.tar.gz" -C dist "$archive_stem"
+        env:
+          MANIFEST_VERSION: ${{ needs.release_gate.outputs.manifest_version }}
+          # pull_request GITHUB_SHA is the ephemeral merge commit; name archives after the PR head.
+          ARCHIVE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-${{ env.TARGET }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
+  assemble:
+    name: Assemble release bundle
+    if: github.ref_type == 'tag' || github.event_name == 'workflow_dispatch'
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: release-*
+          path: dist
+          merge-multiple: true
+
+      - name: Generate checksums
+        working-directory: dist
+        run: sha256sum ./*.tar.gz > SHA256SUMS
+
+      - name: Upload release bundle
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-bundle
+          path: |
+            dist/*.tar.gz
+            dist/SHA256SUMS
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
+  release:
+    name: Publish GitHub Release
+    if: >-
+      github.ref_type == 'tag' &&
+      (github.event_name == 'push' || inputs.publish)
+    needs: assemble
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - name: Download release bundle
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-bundle
+          path: dist
+
+      - name: Create draft release
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            is_draft="$(gh release view "$GITHUB_REF_NAME" --json isDraft --jq '.isDraft')"
+            if [[ "$is_draft" != "true" ]]; then
+              echo "Release $GITHUB_REF_NAME is already published" >&2
+              exit 1
+            fi
+          else
+            gh release create "$GITHUB_REF_NAME" --draft --verify-tag --generate-notes --title "$GITHUB_REF_NAME"
+          fi
+
+      - name: Upload release assets
+        run: gh release upload "$GITHUB_REF_NAME" dist/*.tar.gz dist/SHA256SUMS --clobber
+
+      - name: Publish release
+        run: gh release edit "$GITHUB_REF_NAME" --draft=false
+    env:
+      GH_REPO: ${{ github.repository }}
+      GH_TOKEN: ${{ github.token }}
