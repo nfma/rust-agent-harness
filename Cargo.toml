@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/harness-cli"]
+members = ["crates/harness-cli", "crates/openai-codex-auth"]
 resolver = "3"
 
 [workspace.package]
