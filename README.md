@@ -22,9 +22,11 @@ cargo test --workspace --locked
 
 CI-based analysis uses `sonar-project.properties` for project
 `nfma_rust-agent-harness`. Automatic Analysis must be disabled under
-**Administration → Analysis Method** in SonarQube Cloud. Add `SONAR_TOKEN` as
-both an Actions secret and a Dependabot secret; the workflow runs formatting,
-Clippy, tests with LCOV coverage, and waits for the quality gate.
+**Administration → Analysis Method** in SonarQube Cloud. Add a repository
+Actions secret named `SONAR_TOKEN`. Dependabot and fork pull requests, which
+cannot read Actions secrets, skip the scan with a warning; a missing token on
+any other run fails the job. The workflow runs formatting, Clippy, tests with
+LCOV coverage, and waits for the quality gate when the scan runs.
 
 ## Releases
 
