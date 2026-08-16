@@ -29,7 +29,10 @@ fn sonar_classifies_pull_request_trust_before_checkout_without_secrets() {
         "trust classification must run before checkout"
     );
     assert!(classifier.contains("github.event.pull_request.user.login == 'dependabot[bot]'"));
-    assert!(classifier.contains("github.event.pull_request.head.repo.fork"));
+    assert!(
+        classifier.contains("github.event.pull_request.head.repo.full_name != github.repository")
+    );
+    assert!(!classifier.contains("github.event.pull_request.head.repo.fork"));
     assert!(!classifier.contains("github.actor"));
     assert!(!classifier.contains("secrets.SONAR_TOKEN"));
 }

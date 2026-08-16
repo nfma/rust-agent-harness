@@ -25,7 +25,7 @@ jobs:
       - name: Classify pull request trust
         id: trust
         env:
-          UNTRUSTED_PULL_REQUEST: ${{ github.event_name == 'pull_request' && (github.event.pull_request.user.login == 'dependabot[bot]' || github.event.pull_request.head.repo.fork) }}
+          UNTRUSTED_PULL_REQUEST: ${{ github.event_name == 'pull_request' && (github.event.pull_request.user.login == 'dependabot[bot]' || github.event.pull_request.head.repo.full_name != github.repository) }}
         run: |
           if [ "$UNTRUSTED_PULL_REQUEST" = "true" ]; then
             echo "trusted=false" >> "$GITHUB_OUTPUT"
