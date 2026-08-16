@@ -7,6 +7,13 @@ fn sonar_workflow() -> String {
     fs::read_to_string(path).expect("read Sonar workflow")
 }
 
+fn dependabot_workflow() -> String {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join(".github/workflows/dependabot-auto-merge.yml");
+    fs::read_to_string(path).expect("read Dependabot auto-merge workflow")
+}
+
 fn workflow_step<'a>(workflow: &'a str, name: &str) -> &'a str {
     let marker = format!("      - name: {name}\n");
     let start = workflow
@@ -66,4 +73,30 @@ fn sonar_gates_every_repository_controlled_and_secret_bearing_step() {
         workflow_step(&workflow, "Scan and wait for the quality gate")
             .contains("-Dsonar.qualitygate.wait=true")
     );
+}
+
+#[test]
+fn dependabot_auto_merge_only_accepts_same_repository_bot_pull_requests() {
+    let workflow = dependabot_workflow();
+
+    assert!(workflow.contains("pull_request:"));
+    assert!(workflow.contains("github.event.pull_request.user.login == 'dependabot[bot]'"));
+    assert!(
+        workflow.contains("github.event.pull_request.head.repo.full_name == github.repository")
+    );
+    assert!(workflow.contains("github.event.pull_request.draft == false"));
+    assert!(!workflow.contains("pull_request_target:"));
+    assert!(!workflow.contains("actions/checkout"));
+    assert!(!workflow.contains("secrets."));
+}
+
+#[test]
+fn dependabot_auto_merge_grants_only_merge_permissions_and_forces_squash() {
+    let workflow = dependabot_workflow();
+
+    assert!(workflow.contains("permissions: {}"));
+    assert!(workflow.contains("permissions:\n      contents: write\n      pull-requests: write"));
+    assert!(workflow.contains("gh pr merge --repo \"$GH_REPO\" --auto --squash \"$PR_NUMBER\""));
+    assert!(!workflow.contains("--merge "));
+    assert!(!workflow.contains("--rebase "));
 }
