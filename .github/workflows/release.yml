@@ -9,6 +9,8 @@ on:
         default: false
         type: boolean
   pull_request:
+  merge_group:
+    types: [checks_requested]
   push:
     branches:
       - trunk
