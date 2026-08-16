@@ -17,6 +17,8 @@ name: Dependency audit
 on:
   pull_request:
     branches: [trunk]
+  merge_group:
+    types: [checks_requested]
   push:
     branches: [trunk]
   schedule:
@@ -82,7 +84,10 @@ jobs:
 
   dependabot-alerts:
     name: GitHub Dependabot alerts
-    if: github.event_name != 'pull_request'
+    if: >-
+      github.event_name == 'push' ||
+      github.event_name == 'schedule' ||
+      github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-24.04
     environment: dependabot-alerts
     timeout-minutes: 10
