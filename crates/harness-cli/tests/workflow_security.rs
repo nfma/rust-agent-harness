@@ -263,3 +263,26 @@ fn dependabot_auto_merge_grants_only_merge_permissions_and_forces_squash() {
     assert!(!workflow.contains("--merge "));
     assert!(!workflow.contains("--rebase "));
 }
+
+#[test]
+fn dependabot_auto_merge_only_allows_cargo_patch_and_minor_updates() {
+    let workflow = dependabot_workflow();
+    let metadata = workflow_step(&workflow, "Inspect Dependabot update");
+    let merge = workflow_step(&workflow, "Enable squash auto-merge");
+    let manual = workflow_step(&workflow, "Explain manual review requirement");
+
+    assert!(
+        metadata.contains(
+            "dependabot/fetch-metadata@25dd0e34f4fe68f24cc83900b1fe3fe149efef98 # v3.1.0"
+        )
+    );
+    assert!(merge.contains("steps.metadata.outputs.package-ecosystem == 'cargo'"));
+    assert!(!merge.contains("package-ecosystem == 'github-actions'"));
+    assert!(merge.contains("update-type == 'version-update:semver-patch'"));
+    assert!(merge.contains("update-type == 'version-update:semver-minor'"));
+    assert!(!merge.contains("version-update:semver-major"));
+    assert!(manual.contains("steps.metadata.outputs.package-ecosystem != 'cargo'"));
+    assert!(manual.contains("update-type != 'version-update:semver-patch'"));
+    assert!(manual.contains("update-type != 'version-update:semver-minor'"));
+    assert!(!manual.contains("gh pr merge"));
+}
