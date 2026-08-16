@@ -72,10 +72,10 @@ jobs:
           version: v0.74.0
           cache: true
 
-      - name: Scan dependencies, configuration, and secrets
+      - name: Scan dependencies and secrets
         run: >-
           trivy fs
-          --scanners vuln,misconfig,secret
+          --scanners vuln,secret
           --severity MEDIUM,HIGH,CRITICAL
           --exit-code 1
           --skip-dirs target

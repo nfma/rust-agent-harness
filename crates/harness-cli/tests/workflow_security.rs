@@ -13,19 +13,66 @@ fn workflows() -> Vec<(String, String)> {
     let directory = repository_root().join(".github/workflows");
     let mut workflows = fs::read_dir(directory)
         .expect("read workflow directory")
-        .map(|entry| {
+        .filter_map(|entry| {
             let path = entry.expect("read workflow entry").path();
+            let extension = path.extension()?.to_str()?;
+            if extension != "yml" && extension != "yaml" {
+                return None;
+            }
             let name = path
                 .file_name()
                 .expect("workflow filename")
                 .to_string_lossy()
                 .into_owned();
             let content = fs::read_to_string(path).expect("read workflow");
-            (name, content)
+            Some((name, content))
         })
         .collect::<Vec<_>>();
     workflows.sort_by(|left, right| left.0.cmp(&right.0));
     workflows
+}
+
+fn action_reference(line: &str) -> Option<&str> {
+    line.trim()
+        .strip_prefix("- ")
+        .unwrap_or(line.trim())
+        .strip_prefix("uses: ")
+        .and_then(|value| value.split_whitespace().next())
+}
+
+fn assert_external_actions_are_pinned(name: &str, workflow: &str) -> usize {
+    let mut checked = 0;
+    for reference in workflow.lines().filter_map(action_reference) {
+        if reference.starts_with("./") {
+            continue;
+        }
+        checked += 1;
+        let (_, revision) = reference
+            .rsplit_once('@')
+            .unwrap_or_else(|| panic!("unversioned action in {name}: {reference}"));
+        assert_eq!(revision.len(), 40, "non-SHA action in {name}: {reference}");
+        assert!(
+            revision
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+            "non-lowercase SHA action in {name}: {reference}"
+        );
+    }
+    checked
+}
+
+fn assert_checkout_credentials_are_disabled(name: &str, workflow: &str) -> usize {
+    let mut checked = 0;
+    for step in workflow.split("\n      - ") {
+        if step.contains("uses: actions/checkout@") {
+            checked += 1;
+            assert!(
+                step.contains("persist-credentials: false"),
+                "checkout persists credentials in {name}"
+            );
+        }
+    }
+    checked
 }
 
 fn dependabot_workflow() -> String {
@@ -96,44 +143,47 @@ fn sonar_gates_every_repository_controlled_and_secret_bearing_step() {
 
 #[test]
 fn every_external_action_is_pinned_to_a_full_commit_sha() {
-    for (name, workflow) in workflows() {
-        for line in workflow.lines() {
-            let Some(reference) = line.trim().strip_prefix("uses: ") else {
-                continue;
-            };
-            let reference = reference
-                .split_whitespace()
-                .next()
-                .expect("action reference");
-            if reference.starts_with("./") {
-                continue;
-            }
-            let (_, revision) = reference
-                .rsplit_once('@')
-                .unwrap_or_else(|| panic!("unversioned action in {name}: {reference}"));
-            assert_eq!(revision.len(), 40, "non-SHA action in {name}: {reference}");
-            assert!(
-                revision
-                    .bytes()
-                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
-                "non-lowercase SHA action in {name}: {reference}"
-            );
-        }
-    }
+    let checked = workflows()
+        .iter()
+        .map(|(name, workflow)| assert_external_actions_are_pinned(name, workflow))
+        .sum::<usize>();
+
+    assert!(checked > 0, "no external action references were checked");
+}
+
+#[test]
+fn action_pin_validator_rejects_an_unpinned_list_step() {
+    let fixture = "jobs:\n  test:\n    steps:\n      - uses: owner/action@v1\n";
+
+    assert!(
+        std::panic::catch_unwind(|| assert_external_actions_are_pinned("fixture.yaml", fixture))
+            .is_err()
+    );
 }
 
 #[test]
 fn every_checkout_disables_persisted_credentials() {
-    for (name, workflow) in workflows() {
-        for step in workflow.split("\n      - name:") {
-            if step.contains("uses: actions/checkout@") {
-                assert!(
-                    step.contains("persist-credentials: false"),
-                    "checkout persists credentials in {name}"
-                );
-            }
-        }
-    }
+    let checked = workflows()
+        .iter()
+        .map(|(name, workflow)| assert_checkout_credentials_are_disabled(name, workflow))
+        .sum::<usize>();
+
+    assert!(checked > 0, "no checkout steps were checked");
+}
+
+#[test]
+fn checkout_validator_rejects_an_action_only_step_with_persisted_credentials() {
+    let fixture = concat!(
+        "jobs:\n  test:\n    steps:\n",
+        "      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd\n",
+    );
+
+    assert!(
+        std::panic::catch_unwind(|| {
+            assert_checkout_credentials_are_disabled("fixture.yml", fixture)
+        })
+        .is_err()
+    );
 }
 
 #[test]
