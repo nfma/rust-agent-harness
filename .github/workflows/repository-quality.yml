@@ -80,7 +80,7 @@ jobs:
         run: zizmor --persona auditor --min-severity medium .github/workflows
 
       - name: Lint YAML
-        run: uvx --from yamllint==1.38.0 yamllint .github
+        run: uvx --no-build --from yamllint==1.38.0 yamllint .github
 
       - name: Validate tracked TOML
         shell: bash
