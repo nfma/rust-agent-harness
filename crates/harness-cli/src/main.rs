@@ -301,53 +301,52 @@ fn parse_auth(arguments: &[OsString]) -> Command<'_> {
         return Command::AuthHelp;
     }
     if second == OsStr::new("logout") {
-        let Some(third) = arguments.get(2) else {
-            return Command::LogoutHelp;
-        };
-        if is_help(third) {
-            return Command::LogoutHelp;
-        }
-        if third != OsStr::new("openai-codex") {
-            return usage_error(third, LOGOUT_USAGE);
-        }
-        if let Some(trailing) = arguments.get(3) {
-            return usage_error(trailing, LOGOUT_USAGE);
-        }
-        return Command::LogoutOpenAiCodex;
+        return parse_auth_provider(
+            arguments,
+            Command::LogoutHelp,
+            LOGOUT_USAGE,
+            Command::LogoutOpenAiCodex,
+        );
     }
     if second == OsStr::new("status") {
-        let Some(third) = arguments.get(2) else {
-            return Command::StatusHelp;
-        };
-        if is_help(third) {
-            return Command::StatusHelp;
-        }
-        if third != OsStr::new("openai-codex") {
-            return usage_error(third, STATUS_USAGE);
-        }
-        if let Some(trailing) = arguments.get(3) {
-            return usage_error(trailing, STATUS_USAGE);
-        }
-        return Command::StatusOpenAiCodex;
+        return parse_auth_provider(
+            arguments,
+            Command::StatusHelp,
+            STATUS_USAGE,
+            Command::StatusOpenAiCodex,
+        );
     }
     if second != OsStr::new("login") {
         return usage_error(second, AUTH_USAGE);
     }
 
-    let Some(third) = arguments.get(2) else {
-        return Command::LoginHelp;
+    parse_auth_provider(
+        arguments,
+        Command::LoginHelp,
+        LOGIN_USAGE,
+        Command::LoginOpenAiCodex,
+    )
+}
+
+fn parse_auth_provider<'a>(
+    arguments: &'a [OsString],
+    help: Command<'a>,
+    usage: &'static str,
+    success: Command<'a>,
+) -> Command<'a> {
+    let Some(provider) = arguments.get(2) else {
+        return help;
     };
-    if is_help(third) {
-        return Command::LoginHelp;
+    if is_help(provider) {
+        return help;
     }
-    if third != OsStr::new("openai-codex") {
-        return usage_error(third, LOGIN_USAGE);
+    if provider != OsStr::new("openai-codex") {
+        return usage_error(provider, usage);
     }
     if let Some(trailing) = arguments.get(3) {
-        return usage_error(trailing, LOGIN_USAGE);
+        return usage_error(trailing, usage);
     }
-
-    Command::LoginOpenAiCodex
+    success
 }
 
 fn parse_model(arguments: &[OsString]) -> Command<'_> {
