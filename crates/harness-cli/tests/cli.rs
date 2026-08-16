@@ -18,7 +18,18 @@ const AUTH_HELP: &str = "Manage account authentication
 Usage: harness auth [OPTIONS] [COMMAND]
 
 Commands:
-  login  Connect an account
+  login   Connect an account
+  status  Inspect an account connection
+
+Options:
+  -h, --help  Print help
+";
+const STATUS_HELP: &str = "Inspect an account connection
+
+Usage: harness auth status [OPTIONS] <PROVIDER>
+
+Providers:
+  openai-codex  OpenAI Codex through a ChatGPT subscription
 
 Options:
   -h, --help  Print help
@@ -161,6 +172,18 @@ fn nested_help_is_available_and_terminal() {
         assert_eq!(String::from_utf8_lossy(&output.stdout), LOGIN_HELP);
         assert!(output.stderr.is_empty());
     }
+
+    for arguments in [
+        &["auth", "status"][..],
+        &["auth", "status", "-h"][..],
+        &["auth", "status", "--help", "ignored"][..],
+    ] {
+        let output = run(arguments);
+
+        assert!(output.status.success());
+        assert_eq!(String::from_utf8_lossy(&output.stdout), STATUS_HELP);
+        assert!(output.stderr.is_empty());
+    }
 }
 
 #[test]
@@ -195,6 +218,21 @@ fn invalid_command_shapes_print_bounded_usage_diagnostics() {
             &["auth", "login", "openai-codex", "extra"][..],
             "extra",
             "harness auth login [OPTIONS] <PROVIDER>",
+        ),
+        (
+            &["auth", "status", "unknown"][..],
+            "unknown",
+            "harness auth status [OPTIONS] <PROVIDER>",
+        ),
+        (
+            &["auth", "status", "openai-codex", "extra"][..],
+            "extra",
+            "harness auth status [OPTIONS] <PROVIDER>",
+        ),
+        (
+            &["auth", "status", "openai-codex", "--help"][..],
+            "--help",
+            "harness auth status [OPTIONS] <PROVIDER>",
         ),
         (
             &["model", "unknown"][..],
@@ -306,6 +344,7 @@ fn double_dash_is_reported_as_invalid_at_each_level() {
         &["--"][..],
         &["auth", "--"][..],
         &["auth", "login", "--"][..],
+        &["auth", "status", "--"][..],
         &["model", "--"][..],
         &["model", "test", "--"][..],
         &["ask", "--"][..],
@@ -338,6 +377,19 @@ fn non_utf8_argument_prints_a_diagnostic() {
     assert_eq!(
         String::from_utf8_lossy(&output.stderr),
         "error: unexpected argument '�'\n\nUsage: harness auth login [OPTIONS] <PROVIDER>\n\nFor more information, try '--help'.\n"
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_harness"))
+        .args(["auth", "status"])
+        .arg(OsString::from_vec(vec![0xff]))
+        .output()
+        .expect("harness should run");
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr),
+        "error: unexpected argument '�'\n\nUsage: harness auth status [OPTIONS] <PROVIDER>\n\nFor more information, try '--help'.\n"
     );
 
     let output = Command::new(env!("CARGO_BIN_EXE_harness"))
@@ -394,4 +446,34 @@ fn closed_output_streams_do_not_panic() {
         .status()
         .expect("harness should run");
     assert!(ask_help.success());
+
+    let status_help = Command::new(env!("CARGO_BIN_EXE_harness"))
+        .args(["auth", "status", "--help"])
+        .stdout(closed_stream())
+        .status()
+        .expect("harness should run");
+    assert!(status_help.success());
+}
+
+#[test]
+fn production_status_discards_the_opaque_credential_capability() {
+    let source = include_str!("../src/main.rs");
+    let (_, implementation) = source
+        .split_once("impl StatusAction for ProductionStatus {")
+        .expect("production status implementation should exist");
+    let (implementation, _) = implementation
+        .split_once("\n}\n")
+        .expect("production status implementation should be bounded");
+
+    assert_eq!(
+        source.matches("with_authorized_credential(|_| ())").count(),
+        1
+    );
+    assert_eq!(
+        implementation
+            .matches("with_authorized_credential(|_| ())")
+            .count(),
+        1
+    );
+    assert!(!implementation.contains("authorize("));
 }
