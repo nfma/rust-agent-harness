@@ -10,7 +10,7 @@ updates:
       timezone: "Europe/Berlin"
     cooldown:
       default-days: 7
-    versioning-strategy: "increase"
+    versioning-strategy: "auto"
     open-pull-requests-limit: 5
     commit-message:
       prefix: "deps"
