@@ -3,6 +3,8 @@ name: Security
 on:
   pull_request:
     branches: [trunk]
+  merge_group:
+    types: [checks_requested]
   push:
     branches: [trunk]
   schedule:
