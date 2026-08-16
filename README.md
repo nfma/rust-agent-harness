@@ -1,6 +1,6 @@
 # Rust agent harness
 
-This repository contains a runnable CLI and native OpenAI Codex account login on macOS. Model requests, the remaining credential lifecycle, MCP, tools, skills, and the TUI are intentionally deferred.
+This repository contains a runnable CLI, native OpenAI Codex account login on macOS, and a fixed model connection diagnostic. The remaining credential lifecycle, arbitrary model requests, MCP, tools, skills, and the TUI are intentionally deferred.
 
 It requires Rust 1.85 or newer.
 
@@ -18,7 +18,15 @@ cargo run -p harness-cli -- auth login openai-codex
 
 The command opens OpenAI's browser authorization flow and prints the same one-time URL as a fallback. On success, it stores a versioned credential under the harness-owned `rust-agent-harness` / `openai-codex:default` macOS Keychain coordinates. It does not read or modify Codex CLI credentials.
 
-This command is also the opt-in live smoke test: it requires a browser, a ChatGPT subscription with Codex access, and Keychain approval. Default tests use local fake endpoints and an in-memory credential store; they never start live OAuth or access the real Keychain.
+Test that stored connection with one fixed `gpt-5.5` Responses request:
+
+```sh
+cargo run --quiet --locked -p harness-cli -- model test openai-codex
+```
+
+The diagnostic reads and validates the harness-owned credential without refreshing or changing it, waits for `response.completed`, and then writes the buffered assistant text once. It does not accept a prompt or model selection, retain a session, expose streaming output, or enable tools.
+
+The two commands together form an opt-in live smoke test. It requires a browser, a ChatGPT subscription with Codex access, Keychain approval, and one paid or included-plan model call. Default tests use local fake endpoints and an in-memory credential store; they never start live OAuth, contact OpenAI, or access the real Keychain.
 
 Verify the workspace:
 

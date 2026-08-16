@@ -6,6 +6,7 @@ Usage: harness [OPTIONS] [COMMAND]
 
 Commands:
   auth  Manage account authentication
+  model Exercise model connections
 
 Options:
   -h, --help     Print help
@@ -24,6 +25,26 @@ Options:
 const LOGIN_HELP: &str = "Connect an account
 
 Usage: harness auth login [OPTIONS] <PROVIDER>
+
+Providers:
+  openai-codex  OpenAI Codex through a ChatGPT subscription
+
+Options:
+  -h, --help  Print help
+";
+const MODEL_HELP: &str = "Exercise model connections
+
+Usage: harness model [OPTIONS] [COMMAND]
+
+Commands:
+  test  Test a model connection
+
+Options:
+  -h, --help  Print help
+";
+const MODEL_TEST_HELP: &str = "Test a model connection
+
+Usage: harness model test [OPTIONS] <PROVIDER>
 
 Providers:
   openai-codex  OpenAI Codex through a ChatGPT subscription
@@ -74,6 +95,30 @@ fn nested_help_is_available_and_terminal() {
     }
 
     for arguments in [
+        &["model"][..],
+        &["model", "-h"][..],
+        &["model", "--help", "ignored"][..],
+    ] {
+        let output = run(arguments);
+
+        assert!(output.status.success());
+        assert_eq!(String::from_utf8_lossy(&output.stdout), MODEL_HELP);
+        assert!(output.stderr.is_empty());
+    }
+
+    for arguments in [
+        &["model", "test"][..],
+        &["model", "test", "-h"][..],
+        &["model", "test", "--help", "ignored"][..],
+    ] {
+        let output = run(arguments);
+
+        assert!(output.status.success());
+        assert_eq!(String::from_utf8_lossy(&output.stdout), MODEL_TEST_HELP);
+        assert!(output.stderr.is_empty());
+    }
+
+    for arguments in [
         &["auth", "login"][..],
         &["auth", "login", "-h"][..],
         &["auth", "login", "--help", "ignored"][..],
@@ -118,6 +163,21 @@ fn invalid_command_shapes_print_bounded_usage_diagnostics() {
             &["auth", "login", "openai-codex", "extra"][..],
             "extra",
             "harness auth login [OPTIONS] <PROVIDER>",
+        ),
+        (
+            &["model", "unknown"][..],
+            "unknown",
+            "harness model [OPTIONS] [COMMAND]",
+        ),
+        (
+            &["model", "test", "unknown"][..],
+            "unknown",
+            "harness model test [OPTIONS] <PROVIDER>",
+        ),
+        (
+            &["model", "test", "openai-codex", "extra"][..],
+            "extra",
+            "harness model test [OPTIONS] <PROVIDER>",
         ),
     ] {
         let output = run(arguments);
@@ -183,6 +243,8 @@ fn double_dash_is_reported_as_invalid_at_each_level() {
         &["--"][..],
         &["auth", "--"][..],
         &["auth", "login", "--"][..],
+        &["model", "--"][..],
+        &["model", "test", "--"][..],
     ] {
         let output = run(arguments);
 
@@ -240,4 +302,11 @@ fn closed_output_streams_do_not_panic() {
         .status()
         .expect("harness should run");
     assert_eq!(invalid.code(), Some(2));
+
+    let model_help = Command::new(env!("CARGO_BIN_EXE_harness"))
+        .args(["model", "--help"])
+        .stdout(closed_stream())
+        .status()
+        .expect("harness should run");
+    assert!(model_help.success());
 }
