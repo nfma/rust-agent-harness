@@ -58,4 +58,14 @@ mod tests {
             URL_SAFE_NO_PAD.encode(Sha256::digest(first.verifier.as_bytes()))
         );
     }
+
+    #[test]
+    fn pkce_s256_matches_rfc_7636_appendix_b() {
+        let secrets = AuthSecrets::fixed("state", "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk");
+
+        assert_eq!(
+            secrets.challenge,
+            "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
+        );
+    }
 }

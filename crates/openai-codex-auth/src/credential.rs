@@ -97,6 +97,30 @@ impl CredentialRecord {
         serde_json::to_vec(self).map_err(|_| CredentialError::Serialization)
     }
 
+    pub(crate) fn deserialize(serialized: &[u8], now: u64) -> Result<Self, StoredCredentialError> {
+        let record: Self =
+            serde_json::from_slice(serialized).map_err(|_| StoredCredentialError::Malformed)?;
+        if record.schema_version != SCHEMA_VERSION {
+            return Err(StoredCredentialError::UnsupportedVersion);
+        }
+        if !valid_header_component(&record.access_token)
+            || !valid_header_component(&record.chatgpt_account_id)
+        {
+            return Err(StoredCredentialError::Malformed);
+        }
+        if record
+            .access_token_expires_at
+            .is_some_and(|expiry| expiry <= now)
+        {
+            return Err(StoredCredentialError::Expired);
+        }
+        Ok(record)
+    }
+
+    pub(crate) fn into_authorization(self) -> (String, String) {
+        (self.access_token, self.chatgpt_account_id)
+    }
+
     pub(crate) fn email(&self) -> Option<&str> {
         self.email.as_deref()
     }
@@ -104,6 +128,20 @@ impl CredentialRecord {
     pub(crate) fn plan(&self) -> Option<&str> {
         self.plan.as_deref()
     }
+}
+
+fn valid_header_component(value: &str) -> bool {
+    !value.is_empty()
+        && value == value.trim()
+        && !value.chars().any(char::is_control)
+        && reqwest::header::HeaderValue::from_str(value).is_ok()
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum StoredCredentialError {
+    UnsupportedVersion,
+    Malformed,
+    Expired,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -262,5 +300,73 @@ mod tests {
 
         assert_eq!(record.email(), None);
         assert_eq!(record.plan(), None);
+    }
+
+    fn stored_record(
+        schema_version: u8,
+        access_token: &str,
+        account_id: &str,
+        expiry: Option<u64>,
+    ) -> Vec<u8> {
+        serde_json::to_vec(&json!({
+            "schema_version": schema_version,
+            "access_token": access_token,
+            "refresh_token": "refresh-token",
+            "id_token": "id-token",
+            "chatgpt_account_id": account_id,
+            "access_token_expires_at": expiry,
+            "email": null,
+            "plan": null
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn stored_version_one_credential_is_validated_for_request_use() {
+        let serialized = stored_record(1, "access-token", "account-one", Some(2_000));
+        let record = CredentialRecord::deserialize(&serialized, 1_000).unwrap();
+
+        assert_eq!(
+            record.into_authorization(),
+            ("access-token".to_owned(), "account-one".to_owned())
+        );
+    }
+
+    #[test]
+    fn stored_credential_rejects_bad_schema_fields_and_expiry() {
+        let cases = [
+            (
+                stored_record(2, "access-token", "account-one", Some(2_000)),
+                StoredCredentialError::UnsupportedVersion,
+            ),
+            (b"not-json".to_vec(), StoredCredentialError::Malformed),
+            (
+                stored_record(1, "", "account-one", Some(2_000)),
+                StoredCredentialError::Malformed,
+            ),
+            (
+                stored_record(1, "access-token", "", Some(2_000)),
+                StoredCredentialError::Malformed,
+            ),
+            (
+                stored_record(1, "access\ntoken", "account-one", Some(2_000)),
+                StoredCredentialError::Malformed,
+            ),
+            (
+                stored_record(1, "access-token", "account\none", Some(2_000)),
+                StoredCredentialError::Malformed,
+            ),
+            (
+                stored_record(1, "access-token", "account-one", Some(1_000)),
+                StoredCredentialError::Expired,
+            ),
+        ];
+
+        for (serialized, expected) in cases {
+            assert_eq!(
+                CredentialRecord::deserialize(&serialized, 1_000).err(),
+                Some(expected)
+            );
+        }
     }
 }
