@@ -51,6 +51,8 @@ fn reconciler_uses_the_repository_scoped_app_without_pr_code() {
         "actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3",
         "vars.NFMA_AUTO_MERGE_CLIENT_ID",
         "secrets.NFMA_AUTO_MERGE_PRIVATE_KEY",
+        "pull-requests: read # Reads structured eligibility state through the API.",
+        "zizmor: ignore[secrets-outside-env] Only mints a short-lived token for this repository.",
         "permission-contents: write",
         "permission-pull-requests: write",
     ] {
