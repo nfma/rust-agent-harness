@@ -22,13 +22,27 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
+      - name: Classify pull request trust
+        id: trust
+        env:
+          UNTRUSTED_PULL_REQUEST: ${{ github.event_name == 'pull_request' && (github.event.pull_request.user.login == 'dependabot[bot]' || github.event.pull_request.head.repo.full_name != github.repository) }}
+        run: |
+          if [ "$UNTRUSTED_PULL_REQUEST" = "true" ]; then
+            echo "trusted=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::Skipping SonarQube Cloud analysis for a Dependabot or fork pull request."
+          else
+            echo "trusted=true" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Check out full history
+        if: steps.trust.outputs.trusted == 'true'
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           fetch-depth: 0
           persist-credentials: false
 
       - name: Install Rust
+        if: steps.trust.outputs.trusted == 'true'
         run: |
           rustup toolchain install "$RUST_TOOLCHAIN" \
             --profile minimal \
@@ -37,35 +51,33 @@ jobs:
           rustup default "$RUST_TOOLCHAIN"
 
       - name: Install cargo-llvm-cov
+        if: steps.trust.outputs.trusted == 'true'
         run: cargo install cargo-llvm-cov --locked --version "$CARGO_LLVM_COV_VERSION"
 
       - name: Check formatting
+        if: steps.trust.outputs.trusted == 'true'
         run: cargo fmt --check
 
       - name: Run Clippy
+        if: steps.trust.outputs.trusted == 'true'
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
       - name: Test with coverage
+        if: steps.trust.outputs.trusted == 'true'
         run: cargo llvm-cov --workspace --all-features --locked --lcov --output-path lcov.info
 
       - name: Check for SonarQube Cloud token
-        id: token
+        if: steps.trust.outputs.trusted == 'true'
         env:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
-          SECRETS_UNAVAILABLE: ${{ github.actor == 'dependabot[bot]' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork) }}
         run: |
-          if [ -n "$SONAR_TOKEN" ]; then
-            echo "available=true" >> "$GITHUB_OUTPUT"
-          elif [ "$SECRETS_UNAVAILABLE" = "true" ]; then
-            echo "available=false" >> "$GITHUB_OUTPUT"
-            echo "::warning::Skipping SonarQube Cloud analysis: Actions secrets are not available to this run."
-          else
+          if [ -z "$SONAR_TOKEN" ]; then
             echo "SONAR_TOKEN is required; add it as a repository Actions secret." >&2
             exit 1
           fi
 
       - name: Scan and wait for the quality gate
-        if: steps.token.outputs.available == 'true'
+        if: steps.trust.outputs.trusted == 'true'
         uses: SonarSource/sonarqube-scan-action@22918119ff8e1ca75a623e15c8296b6ea4fbe28f # v8.2.1
         env:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
