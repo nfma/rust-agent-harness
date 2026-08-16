@@ -18,6 +18,7 @@ const INSTRUCTIONS: &str =
     "Return only the requested plain-text verification response. Do not call tools.";
 const PROMPT: &str = "Reply with exactly: OpenAI Codex connection verified.";
 const ORIGINATOR: &str = "rust-agent-harness";
+const PROVIDER_CLIENT_VERSION: &str = "0.144.0";
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 
@@ -207,7 +208,7 @@ fn test_connection_with(
             USER_AGENT,
             concat!("rust-agent-harness/", env!("CARGO_PKG_VERSION")),
         )
-        .header("version", env!("CARGO_PKG_VERSION"))
+        .header("version", PROVIDER_CLIENT_VERSION)
         .header("session-id", &correlation_id)
         .header("x-client-request-id", &correlation_id)
         .json(&request_body());
@@ -241,11 +242,17 @@ fn validate_status(status: StatusCode) -> Result<(), ModelTestError> {
 fn validate_content_type(
     content_type: Option<&reqwest::header::HeaderValue>,
 ) -> Result<(), ModelTestError> {
-    let valid = content_type
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.split(';').next())
-        .is_some_and(|value| value.trim().eq_ignore_ascii_case("text/event-stream"));
-    if valid {
+    let Some(content_type) = content_type else {
+        return Ok(());
+    };
+    let Ok(content_type) = content_type.to_str() else {
+        return Ok(());
+    };
+    if content_type
+        .split(';')
+        .next()
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case("text/event-stream"))
+    {
         Ok(())
     } else {
         Err(ModelTestError::InvalidProviderResponse)
@@ -436,7 +443,7 @@ mod tests {
             request.headers["user-agent"],
             concat!("rust-agent-harness/", env!("CARGO_PKG_VERSION"))
         );
-        assert_eq!(request.headers["version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(request.headers["version"], "0.144.0");
         assert_eq!(request.headers["accept"], "text/event-stream");
         assert_eq!(request.headers["content-type"], "application/json");
         assert_eq!(request.headers["session-id"], "correlation-one");
@@ -591,11 +598,26 @@ mod tests {
     }
 
     #[test]
+    fn missing_content_type_with_valid_sse_succeeds() {
+        let server = FakeServer::responses(vec![(200, None, completed("verified"))]);
+        let mut correlation_ids = ids(&["missing-content-type"]);
+
+        let result = test_connection_with(
+            &FakeAuthorizer,
+            &config(server.endpoint.clone()),
+            &mut correlation_ids,
+        );
+        server.finish();
+
+        assert_eq!(result.as_deref(), Ok("verified"));
+    }
+
+    #[test]
     fn wrong_content_type_and_bounded_response_fail_without_provider_data() {
         let cases = [
             (Some("application/json"), completed("hidden"), 32 * 1024),
-            (None, completed("hidden"), 32 * 1024),
             (Some("text/event-stream"), vec![b'x'; 1024], 100),
+            (None, vec![b'x'; 1024], 100),
         ];
 
         for (content_type, body, response_bytes) in cases {
@@ -609,6 +631,18 @@ mod tests {
 
             assert_eq!(result, Err(ModelTestError::InvalidProviderResponse));
         }
+    }
+
+    #[test]
+    fn unusable_content_type_with_valid_sse_succeeds() {
+        let response = b"HTTP/1.1 200 OK\r\nContent-Type: \xff\r\nConnection: close\r\n\r\ndata: {\"type\":\"response.output_text.done\",\"text\":\"verified\"}\n\ndata: {\"type\":\"response.completed\"}\n\n";
+        let (endpoint, server) = raw_server(response, None);
+        let mut correlation_ids = ids(&["unusable-content-type"]);
+
+        let result = test_connection_with(&FakeAuthorizer, &config(endpoint), &mut correlation_ids);
+        server.join().unwrap();
+
+        assert_eq!(result.as_deref(), Ok("verified"));
     }
 
     fn raw_server(
