@@ -1,6 +1,6 @@
 # Rust agent harness
 
-This repository contains a runnable CLI, native OpenAI Codex account login on macOS, and a fixed model connection diagnostic. The remaining credential lifecycle, arbitrary model requests, MCP, tools, skills, and the TUI are intentionally deferred.
+This repository contains a runnable CLI, native OpenAI Codex account login on macOS, a one-shot OpenAI Codex question, and a fixed model connection diagnostic. The remaining credential lifecycle, conversations, MCP, tools, skills, and the TUI are intentionally deferred.
 
 It requires Rust 1.85 or newer.
 
@@ -24,9 +24,16 @@ Test that stored connection with one fixed `gpt-5.5` Responses request:
 cargo run --quiet --locked -p harness-cli -- model test openai-codex
 ```
 
-The diagnostic reads and validates the harness-owned credential without refreshing or changing it, waits for `response.completed`, and then writes the buffered assistant text once. It does not accept a prompt or model selection, retain a session, expose streaming output, or enable tools.
+Ask one question with the same fixed model and bounded transport:
 
-The two commands together form an opt-in live smoke test. It requires a browser, a ChatGPT subscription with Codex access, Keychain approval, and one paid or included-plan model call. Default tests use local fake endpoints and an in-memory credential store; they never start live OAuth, contact OpenAI, or access the real Keychain.
+```sh
+cargo run --quiet --locked -p harness-cli -- ask openai-codex \
+  "Explain in three bullets when Rust's Arc<Mutex<T>> is appropriate."
+```
+
+Both model commands read and validate the harness-owned credential without refreshing or changing it, wait for `response.completed`, and then write terminal-safe buffered assistant text once. Terminal and Unicode bidi controls become visible `\u{...}` escapes; all other Unicode, including other invisible format characters, is preserved byte-for-byte. This is not a general confusable or invisible-text detector. `ask` accepts exactly one non-empty UTF-8 prompt of at most 32 KiB. It does not read stdin or files, accept model selection, retain a session, expose streaming output, or enable tools. Because the prompt is a positional argument, it may be recorded in shell history; use it only for ordinary questions and known-safe snippets.
+
+Login followed by either model command forms an opt-in live smoke test. It requires a browser, a ChatGPT subscription with Codex access, Keychain approval, and one paid or included-plan model call. Default tests use local fake endpoints and an in-memory credential store; they never start live OAuth, contact OpenAI, or access the real Keychain.
 
 Verify the workspace:
 
