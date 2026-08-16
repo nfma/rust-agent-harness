@@ -4,6 +4,7 @@ use std::io::{self, ErrorKind, Write};
 use std::process::ExitCode;
 
 use harness_openai_codex_auth::{ConnectedAccount, LoginError, LoginProgress};
+use harness_openai_codex_model::ModelTestError;
 
 const HELP: &str = "A local coding-agent harness
 
@@ -11,6 +12,7 @@ Usage: harness [OPTIONS] [COMMAND]
 
 Commands:
   auth  Manage account authentication
+  model Exercise model connections
 
 Options:
   -h, --help     Print help
@@ -36,25 +38,59 @@ Providers:
 Options:
   -h, --help  Print help
 ";
+const MODEL_HELP: &str = "Exercise model connections
+
+Usage: harness model [OPTIONS] [COMMAND]
+
+Commands:
+  test  Test a model connection
+
+Options:
+  -h, --help  Print help
+";
+const MODEL_TEST_HELP: &str = "Test a model connection
+
+Usage: harness model test [OPTIONS] <PROVIDER>
+
+Providers:
+  openai-codex  OpenAI Codex through a ChatGPT subscription
+
+Options:
+  -h, --help  Print help
+";
 const ROOT_USAGE: &str = "harness [OPTIONS] [COMMAND]";
 const AUTH_USAGE: &str = "harness auth [OPTIONS] [COMMAND]";
 const LOGIN_USAGE: &str = "harness auth login [OPTIONS] <PROVIDER>";
+const MODEL_USAGE: &str = "harness model [OPTIONS] [COMMAND]";
+const MODEL_TEST_USAGE: &str = "harness model test [OPTIONS] <PROVIDER>";
 const MAX_DIAGNOSTIC_ARGUMENT_CHARS: usize = 256;
 
 fn main() -> ExitCode {
     let arguments: Vec<_> = env::args_os().skip(1).collect();
     let mut login = ProductionLogin;
-    let completion = run_application(&arguments, &mut io::stdout(), &mut io::stderr(), &mut login);
+    let mut model = ProductionModel;
+    let completion = run_application(
+        &arguments,
+        &mut io::stdout(),
+        &mut io::stderr(),
+        &mut login,
+        &mut model,
+    );
     complete(completion)
 }
 
 struct ProductionLogin;
+struct ProductionModel;
 
 trait LoginAction {
     fn login(
         &mut self,
         progress: &mut dyn FnMut(CliLoginProgress),
     ) -> Result<ConnectedAccount, LoginError>;
+}
+
+trait ModelAction {
+    fn test_openai_codex(&mut self) -> Result<String, ModelTestError>;
 }
 
 enum CliLoginProgress {
@@ -69,6 +105,12 @@ impl LoginAction for ProductionLogin {
         progress: &mut dyn FnMut(CliLoginProgress),
     ) -> Result<ConnectedAccount, LoginError> {
         harness_openai_codex_auth::login(|event| progress(map_login_progress(event)))
+    }
+}
+
+impl ModelAction for ProductionModel {
+    fn test_openai_codex(&mut self) -> Result<String, ModelTestError> {
+        harness_openai_codex_model::test_connection()
     }
 }
 
@@ -99,6 +141,9 @@ enum Command {
     AuthHelp,
     LoginHelp,
     LoginOpenAiCodex,
+    ModelHelp,
+    ModelTestHelp,
+    ModelTestOpenAiCodex,
     UsageError {
         argument: OsString,
         usage: &'static str,
@@ -110,6 +155,7 @@ fn run_application(
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
     login: &mut dyn LoginAction,
+    model: &mut dyn ModelAction,
 ) -> Completion {
     match parse_command(arguments) {
         Command::RootHelp => Completion::new(ExitCode::SUCCESS, write!(stdout, "{HELP}")),
@@ -120,6 +166,11 @@ fn run_application(
         Command::AuthHelp => Completion::new(ExitCode::SUCCESS, write!(stdout, "{AUTH_HELP}")),
         Command::LoginHelp => Completion::new(ExitCode::SUCCESS, write!(stdout, "{LOGIN_HELP}")),
         Command::LoginOpenAiCodex => run_login(stdout, stderr, login),
+        Command::ModelHelp => Completion::new(ExitCode::SUCCESS, write!(stdout, "{MODEL_HELP}")),
+        Command::ModelTestHelp => {
+            Completion::new(ExitCode::SUCCESS, write!(stdout, "{MODEL_TEST_HELP}"))
+        }
+        Command::ModelTestOpenAiCodex => run_model_test(stdout, stderr, model),
         Command::UsageError { argument, usage } => Completion::new(
             ExitCode::from(2),
             print_usage_error(stderr, &argument, usage),
@@ -137,10 +188,16 @@ fn parse_command(arguments: &[OsString]) -> Command {
     if first == OsStr::new("-V") || first == OsStr::new("--version") {
         return Command::Version;
     }
-    if first != OsStr::new("auth") {
-        return usage_error(first, ROOT_USAGE);
+    if first == OsStr::new("auth") {
+        return parse_auth(arguments);
     }
+    if first == OsStr::new("model") {
+        return parse_model(arguments);
+    }
+    usage_error(first, ROOT_USAGE)
+}
 
+fn parse_auth(arguments: &[OsString]) -> Command {
     let Some(second) = arguments.get(1) else {
         return Command::AuthHelp;
     };
@@ -165,6 +222,33 @@ fn parse_command(arguments: &[OsString]) -> Command {
     }
 
     Command::LoginOpenAiCodex
+}
+
+fn parse_model(arguments: &[OsString]) -> Command {
+    let Some(second) = arguments.get(1) else {
+        return Command::ModelHelp;
+    };
+    if is_help(second) {
+        return Command::ModelHelp;
+    }
+    if second != OsStr::new("test") {
+        return usage_error(second, MODEL_USAGE);
+    }
+
+    let Some(third) = arguments.get(2) else {
+        return Command::ModelTestHelp;
+    };
+    if is_help(third) {
+        return Command::ModelTestHelp;
+    }
+    if third != OsStr::new("openai-codex") {
+        return usage_error(third, MODEL_TEST_USAGE);
+    }
+    if let Some(trailing) = arguments.get(3) {
+        return usage_error(trailing, MODEL_TEST_USAGE);
+    }
+
+    Command::ModelTestOpenAiCodex
 }
 
 fn is_help(argument: &OsStr) -> bool {
@@ -225,6 +309,17 @@ fn run_login(
     Completion::new(status, output)
 }
 
+fn run_model_test(
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+    model: &mut dyn ModelAction,
+) -> Completion {
+    match model.test_openai_codex() {
+        Ok(text) => Completion::new(ExitCode::SUCCESS, writeln!(stdout, "{text}")),
+        Err(error) => Completion::new(ExitCode::FAILURE, writeln!(stderr, "error: {error}")),
+    }
+}
+
 fn print_usage_error(output: &mut dyn Write, argument: &OsStr, usage: &str) -> io::Result<()> {
     let argument = format_argument(argument);
 
@@ -276,6 +371,18 @@ mod tests {
         browser_failure: bool,
     }
 
+    struct FakeModel {
+        result: Result<String, ModelTestError>,
+        calls: usize,
+    }
+
+    impl ModelAction for FakeModel {
+        fn test_openai_codex(&mut self) -> Result<String, ModelTestError> {
+            self.calls += 1;
+            self.result.clone()
+        }
+    }
+
     impl LoginAction for FakeLogin {
         fn login(
             &mut self,
@@ -304,11 +411,26 @@ mod tests {
         }
     }
 
+    fn fake_model_success() -> FakeModel {
+        FakeModel {
+            result: Ok("OpenAI Codex connection verified.".to_owned()),
+            calls: 0,
+        }
+    }
+
     fn run(arguments: &[&str], login: &mut FakeLogin) -> (ExitCode, String, String) {
+        run_with_model(arguments, login, &mut fake_model_success())
+    }
+
+    fn run_with_model(
+        arguments: &[&str],
+        login: &mut FakeLogin,
+        model: &mut FakeModel,
+    ) -> (ExitCode, String, String) {
         let arguments: Vec<_> = arguments.iter().map(OsString::from).collect();
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
-        let completion = run_application(&arguments, &mut stdout, &mut stderr, login);
+        let completion = run_application(&arguments, &mut stdout, &mut stderr, login, model);
         let status = complete(completion);
         (
             status,
@@ -326,6 +448,18 @@ mod tests {
 
         fn flush(&mut self) -> io::Result<()> {
             Err(io::Error::new(ErrorKind::BrokenPipe, "closed"))
+        }
+    }
+
+    struct FailedWriter;
+
+    impl Write for FailedWriter {
+        fn write(&mut self, _buffer: &[u8]) -> io::Result<usize> {
+            Err(io::Error::other("failed"))
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Err(io::Error::other("failed"))
         }
     }
 
@@ -354,6 +488,79 @@ mod tests {
                 "Opening your browser to connect OpenAI Codex.\nIf it does not open, visit: https://auth.openai.com/oauth/authorize?state={STATE}&code_challenge=challenge\n"
             )
         );
+    }
+
+    #[test]
+    fn only_the_exact_model_test_command_invokes_the_action() {
+        for arguments in [
+            &[][..],
+            &["model"][..],
+            &["model", "test"][..],
+            &["model", "other"][..],
+            &["model", "test", "other"][..],
+            &["model", "test", "openai-codex", "extra"][..],
+            &["auth", "login", "openai-codex"][..],
+        ] {
+            let mut login = fake_success();
+            let mut model = fake_model_success();
+            let _ = run_with_model(arguments, &mut login, &mut model);
+            assert_eq!(model.calls, 0, "unexpected invocation for {arguments:?}");
+        }
+
+        let mut login = fake_success();
+        let mut model = fake_model_success();
+        let (status, stdout, stderr) =
+            run_with_model(&["model", "test", "openai-codex"], &mut login, &mut model);
+
+        assert_eq!(model.calls, 1);
+        assert_eq!(login.calls, 0);
+        assert_eq!(status, ExitCode::SUCCESS);
+        assert_eq!(stdout, "OpenAI Codex connection verified.\n");
+        assert!(stderr.is_empty());
+    }
+
+    #[test]
+    fn model_errors_use_stderr_exit_one_and_never_expose_credential_sentinels() {
+        for error in [
+            ModelTestError::UnsupportedPlatform,
+            ModelTestError::NotConnected,
+            ModelTestError::CredentialStoreUnavailable,
+            ModelTestError::InvalidCredential,
+            ModelTestError::ExpiredCredential,
+            ModelTestError::Unavailable,
+            ModelTestError::UnexpectedProviderResponse,
+            ModelTestError::ConnectionRejected,
+            ModelTestError::AccessDenied,
+            ModelTestError::RateLimited,
+            ModelTestError::TemporarilyUnavailable,
+            ModelTestError::Rejected,
+            ModelTestError::InvalidProviderResponse,
+            ModelTestError::ModelCallFailed,
+            ModelTestError::EmptyResponse,
+        ] {
+            let mut login = fake_success();
+            let mut model = FakeModel {
+                result: Err(error),
+                calls: 0,
+            };
+            let (status, stdout, stderr) =
+                run_with_model(&["model", "test", "openai-codex"], &mut login, &mut model);
+            let combined = format!("{stdout}{stderr}");
+
+            assert_eq!(status, ExitCode::FAILURE);
+            assert!(stdout.is_empty());
+            assert!(stderr.starts_with("error: "));
+            assert_eq!(model.calls, 1);
+            for secret in [
+                ACCESS_TOKEN,
+                REFRESH_TOKEN,
+                ID_TOKEN,
+                CALLBACK_CODE,
+                VERIFIER,
+            ] {
+                assert!(!combined.contains(secret));
+            }
+        }
     }
 
     #[test]
@@ -479,8 +686,13 @@ mod tests {
             .collect();
 
         let mut success = fake_success();
-        let completion =
-            run_application(&arguments, &mut Vec::new(), &mut BrokenWriter, &mut success);
+        let completion = run_application(
+            &arguments,
+            &mut Vec::new(),
+            &mut BrokenWriter,
+            &mut success,
+            &mut fake_model_success(),
+        );
         assert_eq!(complete(completion), ExitCode::SUCCESS);
 
         let mut failure = FakeLogin {
@@ -488,13 +700,62 @@ mod tests {
             calls: 0,
             browser_failure: false,
         };
-        let completion =
-            run_application(&arguments, &mut Vec::new(), &mut BrokenWriter, &mut failure);
+        let completion = run_application(
+            &arguments,
+            &mut Vec::new(),
+            &mut BrokenWriter,
+            &mut failure,
+            &mut fake_model_success(),
+        );
         assert_eq!(complete(completion), ExitCode::FAILURE);
 
         let mut success = fake_success();
-        let completion =
-            run_application(&arguments, &mut BrokenWriter, &mut Vec::new(), &mut success);
+        let completion = run_application(
+            &arguments,
+            &mut BrokenWriter,
+            &mut Vec::new(),
+            &mut success,
+            &mut fake_model_success(),
+        );
         assert_eq!(complete(completion), ExitCode::SUCCESS);
+    }
+
+    #[test]
+    fn model_output_failures_preserve_broken_pipe_status_only() {
+        let arguments: Vec<_> = ["model", "test", "openai-codex"]
+            .into_iter()
+            .map(OsString::from)
+            .collect();
+
+        let completion = run_application(
+            &arguments,
+            &mut BrokenWriter,
+            &mut Vec::new(),
+            &mut fake_success(),
+            &mut fake_model_success(),
+        );
+        assert_eq!(complete(completion), ExitCode::SUCCESS);
+
+        let completion = run_application(
+            &arguments,
+            &mut FailedWriter,
+            &mut Vec::new(),
+            &mut fake_success(),
+            &mut fake_model_success(),
+        );
+        assert_eq!(complete(completion), ExitCode::FAILURE);
+
+        let mut failed_model = FakeModel {
+            result: Err(ModelTestError::Unavailable),
+            calls: 0,
+        };
+        let completion = run_application(
+            &arguments,
+            &mut Vec::new(),
+            &mut BrokenWriter,
+            &mut fake_success(),
+            &mut failed_model,
+        );
+        assert_eq!(complete(completion), ExitCode::FAILURE);
     }
 }

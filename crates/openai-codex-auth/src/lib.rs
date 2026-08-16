@@ -20,7 +20,7 @@ use credential::SystemClock;
 #[cfg(any(target_os = "macos", test))]
 use credential::{Clock, CredentialRecord};
 #[cfg(any(target_os = "macos", test))]
-use keychain::CredentialStore;
+use keychain::{CredentialReader, CredentialStore};
 #[cfg(any(target_os = "macos", test))]
 use oauth::{ExchangeConfig, ExchangeError};
 #[cfg(any(target_os = "macos", test))]
@@ -124,6 +124,106 @@ impl fmt::Display for LoginError {
 }
 
 impl std::error::Error for LoginError {}
+
+pub struct AuthorizedCredential {
+    access_token: String,
+    account_id: String,
+}
+
+impl AuthorizedCredential {
+    pub fn authorize(
+        &self,
+        request: reqwest::blocking::RequestBuilder,
+    ) -> reqwest::blocking::RequestBuilder {
+        let mut account_id = reqwest::header::HeaderValue::try_from(self.account_id.as_str())
+            .expect("validated account id must remain a valid header value");
+        account_id.set_sensitive(true);
+        request
+            .bearer_auth(&self.access_token)
+            .header("ChatGPT-Account-ID", account_id)
+    }
+}
+
+impl fmt::Debug for AuthorizedCredential {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("AuthorizedCredential([REDACTED])")
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CredentialReadError {
+    UnsupportedPlatform,
+    NotConnected,
+    StoreUnavailable,
+    UnsupportedVersion,
+    InvalidCredential,
+    Expired,
+}
+
+impl fmt::Display for CredentialReadError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::UnsupportedPlatform => "OpenAI Codex credentials are supported only on macOS",
+            Self::NotConnected => {
+                "OpenAI Codex is not connected; run 'harness auth login openai-codex'"
+            }
+            Self::StoreUnavailable => "the OpenAI Codex credential store is unavailable",
+            Self::UnsupportedVersion | Self::InvalidCredential => {
+                "the stored OpenAI Codex connection is invalid; run 'harness auth login openai-codex'"
+            }
+            Self::Expired => {
+                "the OpenAI Codex connection expired; run 'harness auth login openai-codex'"
+            }
+        })
+    }
+}
+
+impl std::error::Error for CredentialReadError {}
+
+pub fn with_authorized_credential<T>(
+    operation: impl FnOnce(&AuthorizedCredential) -> T,
+) -> Result<T, CredentialReadError> {
+    #[cfg(target_os = "macos")]
+    {
+        with_authorized_credential_from(&keychain::MacOsKeychain, &SystemClock, operation)
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = operation;
+        Err(CredentialReadError::UnsupportedPlatform)
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn with_authorized_credential_from<T>(
+    reader: &dyn CredentialReader,
+    clock: &dyn Clock,
+    operation: impl FnOnce(&AuthorizedCredential) -> T,
+) -> Result<T, CredentialReadError> {
+    let serialized = reader
+        .read()
+        .map_err(|_| CredentialReadError::StoreUnavailable)?
+        .ok_or(CredentialReadError::NotConnected)?;
+    let record =
+        CredentialRecord::deserialize(&serialized, clock.unix_seconds()).map_err(|error| {
+            match error {
+                credential::StoredCredentialError::UnsupportedVersion => {
+                    CredentialReadError::UnsupportedVersion
+                }
+                credential::StoredCredentialError::Malformed => {
+                    CredentialReadError::InvalidCredential
+                }
+                credential::StoredCredentialError::Expired => CredentialReadError::Expired,
+            }
+        })?;
+    let (access_token, account_id) = record.into_authorization();
+    let credential = AuthorizedCredential {
+        access_token,
+        account_id,
+    };
+    Ok(operation(&credential))
+}
 
 pub fn login(progress: impl FnMut(LoginProgress)) -> Result<ConnectedAccount, LoginError> {
     #[cfg(target_os = "macos")]
@@ -263,6 +363,7 @@ fn map_exchange_error(error: ExchangeError) -> LoginError {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
     use std::collections::HashMap;
     use std::io::{Read, Write};
     use std::net::{Ipv4Addr, TcpListener, TcpStream};
@@ -308,6 +409,49 @@ mod tests {
             }
             self.record = Some(record.to_vec());
             Ok(())
+        }
+    }
+
+    struct MemoryReader {
+        record: Option<Vec<u8>>,
+        fail: bool,
+        reads: Cell<usize>,
+    }
+
+    impl CredentialReader for MemoryReader {
+        fn read(&self) -> Result<Option<Vec<u8>>, keychain::StoreError> {
+            self.reads.set(self.reads.get() + 1);
+            if self.fail {
+                return Err(keychain::StoreError);
+            }
+            Ok(self.record.clone())
+        }
+    }
+
+    fn stored_credential(
+        schema_version: u8,
+        access_token: &str,
+        account_id: &str,
+        expiry: Option<u64>,
+    ) -> Vec<u8> {
+        serde_json::to_vec(&json!({
+            "schema_version": schema_version,
+            "access_token": access_token,
+            "refresh_token": "stored-refresh-token-sentinel",
+            "id_token": "stored-id-token-sentinel",
+            "chatgpt_account_id": account_id,
+            "access_token_expires_at": expiry,
+            "email": null,
+            "plan": null
+        }))
+        .unwrap()
+    }
+
+    fn memory_reader(record: Option<Vec<u8>>) -> MemoryReader {
+        MemoryReader {
+            record,
+            fail: false,
+            reads: Cell::new(0),
         }
     }
 
@@ -508,6 +652,126 @@ mod tests {
         assert_eq!(progress[0], "OpeningBrowser");
         assert_eq!(progress[1], "AuthorizationUrl([REDACTED])");
         assert_eq!(progress.len(), 2);
+    }
+
+    #[test]
+    fn credential_read_applies_headers_through_an_opaque_redacted_capability() {
+        let access = "stored-access-token-sentinel";
+        let account = "stored-account-id-sentinel";
+        let reader = memory_reader(Some(stored_credential(1, access, account, Some(2_000))));
+
+        let request = with_authorized_credential_from(&reader, &FixedClock, |credential| {
+            assert_eq!(
+                format!("{credential:?}"),
+                "AuthorizedCredential([REDACTED])"
+            );
+            credential
+                .authorize(reqwest::blocking::Client::new().get("http://127.0.0.1/"))
+                .build()
+                .unwrap()
+        })
+        .unwrap();
+
+        assert_eq!(
+            request.headers()[reqwest::header::AUTHORIZATION],
+            format!("Bearer {access}")
+        );
+        assert_eq!(request.headers()["ChatGPT-Account-ID"], account);
+        assert!(request.headers()["ChatGPT-Account-ID"].is_sensitive());
+        assert_eq!(reader.reads.get(), 1);
+    }
+
+    #[test]
+    fn credential_read_failures_are_typed_and_never_invoke_the_operation() {
+        let cases = [
+            (None, false, CredentialReadError::NotConnected),
+            (None, true, CredentialReadError::StoreUnavailable),
+            (
+                Some(stored_credential(
+                    2,
+                    "access-token",
+                    "account-one",
+                    Some(2_000),
+                )),
+                false,
+                CredentialReadError::UnsupportedVersion,
+            ),
+            (
+                Some(b"malformed-keychain-json-sentinel".to_vec()),
+                false,
+                CredentialReadError::InvalidCredential,
+            ),
+            (
+                Some(stored_credential(1, "", "account-one", Some(2_000))),
+                false,
+                CredentialReadError::InvalidCredential,
+            ),
+            (
+                Some(stored_credential(1, "access-token", "", Some(2_000))),
+                false,
+                CredentialReadError::InvalidCredential,
+            ),
+            (
+                Some(stored_credential(
+                    1,
+                    "access-token",
+                    "account-one",
+                    Some(1_000),
+                )),
+                false,
+                CredentialReadError::Expired,
+            ),
+        ];
+
+        for (record, fail, expected) in cases {
+            let mut reader = memory_reader(record);
+            reader.fail = fail;
+            let invoked = Cell::new(false);
+
+            let result = with_authorized_credential_from(&reader, &FixedClock, |_| {
+                invoked.set(true);
+            });
+
+            assert_eq!(result, Err(expected));
+            assert!(!invoked.get());
+            assert_eq!(reader.reads.get(), 1);
+        }
+    }
+
+    #[test]
+    fn credential_read_errors_and_debug_output_do_not_expose_stored_secrets() {
+        let sentinels = [
+            "stored-access-token-sentinel",
+            "stored-refresh-token-sentinel",
+            "stored-id-token-sentinel",
+            "stored-account-id-sentinel",
+            "malformed-keychain-json-sentinel",
+        ];
+        let reader = memory_reader(Some(stored_credential(
+            1,
+            sentinels[0],
+            sentinels[3],
+            Some(2_000),
+        )));
+        let debug = with_authorized_credential_from(&reader, &FixedClock, |credential| {
+            format!("{credential:?}")
+        })
+        .unwrap();
+        let mut rendered = debug;
+        for error in [
+            CredentialReadError::UnsupportedPlatform,
+            CredentialReadError::NotConnected,
+            CredentialReadError::StoreUnavailable,
+            CredentialReadError::UnsupportedVersion,
+            CredentialReadError::InvalidCredential,
+            CredentialReadError::Expired,
+        ] {
+            rendered.push_str(&format!("{error:?} {error}"));
+        }
+
+        for sentinel in sentinels {
+            assert!(!rendered.contains(sentinel));
+        }
     }
 
     #[test]

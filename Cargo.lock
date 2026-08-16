@@ -277,6 +277,7 @@ name = "harness-cli"
 version = "0.1.0"
 dependencies = [
  "harness-openai-codex-auth",
+ "harness-openai-codex-model",
 ]
 
 [[package]]
@@ -293,6 +294,18 @@ dependencies = [
  "tiny_http",
  "url",
  "webbrowser",
+]
+
+[[package]]
+name = "harness-openai-codex-model"
+version = "0.1.0"
+dependencies = [
+ "harness-openai-codex-auth",
+ "rand 0.8.7",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tiny_http",
 ]
 
 [[package]]
