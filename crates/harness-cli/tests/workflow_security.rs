@@ -63,11 +63,29 @@ fn assert_external_actions_are_pinned(name: &str, workflow: &str) -> usize {
 
 fn assert_checkout_credentials_are_disabled(name: &str, workflow: &str) -> usize {
     let mut checked = 0;
-    for step in workflow.split("\n      - ") {
+    let mut steps = Vec::new();
+    let mut current_step = String::new();
+    for line in workflow.lines() {
+        if line.trim_start().starts_with("- ") && !current_step.is_empty() {
+            steps.push(current_step);
+            current_step = String::new();
+        }
+        if !current_step.is_empty() || line.trim_start().starts_with("- ") {
+            current_step.push_str(line);
+            current_step.push('\n');
+        }
+    }
+    if !current_step.is_empty() {
+        steps.push(current_step);
+    }
+
+    for step in steps {
         if step.contains("uses: actions/checkout@") {
             checked += 1;
             assert!(
-                step.contains("persist-credentials: false"),
+                step.lines()
+                    .map(|line| line.split('#').next().unwrap_or("").trim())
+                    .any(|line| line == "persist-credentials: false"),
                 "checkout persists credentials in {name}"
             );
         }
@@ -173,17 +191,35 @@ fn every_checkout_disables_persisted_credentials() {
 
 #[test]
 fn checkout_validator_rejects_an_action_only_step_with_persisted_credentials() {
-    let fixture = concat!(
-        "jobs:\n  test:\n    steps:\n",
-        "      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd\n",
-    );
+    let fixtures = [
+        (
+            "comment-spoof.yml",
+            concat!(
+                "jobs:\n  test:\n    steps:\n",
+                "      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd\n",
+                "        # persist-credentials: false\n",
+            ),
+        ),
+        (
+            "four-space-indent.yml",
+            concat!(
+                "jobs:\n  test:\n    steps:\n",
+                "    - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd\n",
+                "    - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd\n",
+                "      with:\n",
+                "        persist-credentials: false\n",
+            ),
+        ),
+    ];
 
-    assert!(
-        std::panic::catch_unwind(|| {
-            assert_checkout_credentials_are_disabled("fixture.yml", fixture)
-        })
-        .is_err()
-    );
+    for (name, fixture) in fixtures {
+        assert!(
+            std::panic::catch_unwind(|| {
+                assert_checkout_credentials_are_disabled(name, fixture)
+            })
+            .is_err()
+        );
+    }
 }
 
 #[test]
