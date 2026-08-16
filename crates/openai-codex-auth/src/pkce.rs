@@ -1,5 +1,5 @@
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-use rand::{RngCore, rngs::OsRng};
+use rand::{TryRng, rngs::SysRng};
 use sha2::{Digest, Sha256};
 
 pub(crate) struct AuthSecrets {
@@ -12,8 +12,12 @@ impl AuthSecrets {
     pub(crate) fn generate() -> Self {
         let mut state_bytes = [0_u8; 32];
         let mut verifier_bytes = [0_u8; 32];
-        OsRng.fill_bytes(&mut state_bytes);
-        OsRng.fill_bytes(&mut verifier_bytes);
+        SysRng
+            .try_fill_bytes(&mut state_bytes)
+            .expect("system random number generator unavailable");
+        SysRng
+            .try_fill_bytes(&mut verifier_bytes)
+            .expect("system random number generator unavailable");
 
         let state = URL_SAFE_NO_PAD.encode(state_bytes);
         let verifier = URL_SAFE_NO_PAD.encode(verifier_bytes);
