@@ -72,30 +72,53 @@ pub(super) fn decode(
         if response_bytes > limits.response_bytes {
             return Err(DecodeError::LimitExceeded);
         }
-        for byte in &buffer[..read] {
-            if *byte == b'\n' {
-                if let Some(text) = process_line(
-                    std::mem::take(&mut pending),
-                    &mut event_data,
-                    &mut event_bytes,
-                    &mut state,
-                    limits,
-                    started,
-                )? {
-                    return Ok(text);
-                }
-                continue;
-            }
-            if event_bytes
-                .checked_add(pending.len())
-                .and_then(|length| length.checked_add(1))
-                .is_none_or(|length| length > limits.event_bytes)
-            {
-                return Err(DecodeError::LimitExceeded);
-            }
-            pending.push(*byte);
+        if let Some(text) = process_chunk(
+            &buffer[..read],
+            &mut pending,
+            &mut event_data,
+            &mut event_bytes,
+            &mut state,
+            limits,
+            started,
+        )? {
+            return Ok(text);
         }
     }
+}
+
+fn process_chunk(
+    chunk: &[u8],
+    pending: &mut Vec<u8>,
+    event_data: &mut String,
+    event_bytes: &mut usize,
+    state: &mut TextState,
+    limits: Limits,
+    started: Instant,
+) -> Result<Option<String>, DecodeError> {
+    for byte in chunk {
+        if *byte == b'\n' {
+            if let Some(text) = process_line(
+                std::mem::take(pending),
+                event_data,
+                event_bytes,
+                state,
+                limits,
+                started,
+            )? {
+                return Ok(Some(text));
+            }
+            continue;
+        }
+        if event_bytes
+            .checked_add(pending.len())
+            .and_then(|length| length.checked_add(1))
+            .is_none_or(|length| length > limits.event_bytes)
+        {
+            return Err(DecodeError::LimitExceeded);
+        }
+        pending.push(*byte);
+    }
+    Ok(None)
 }
 
 fn process_line(
