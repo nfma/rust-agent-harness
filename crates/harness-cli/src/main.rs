@@ -3,7 +3,9 @@ use std::ffi::{OsStr, OsString};
 use std::io::{self, ErrorKind, Write};
 use std::process::ExitCode;
 
-use harness_openai_codex_auth::{ConnectedAccount, CredentialReadError, LoginError, LoginProgress};
+use harness_openai_codex_auth::{
+    ConnectedAccount, CredentialReadError, LoginError, LoginProgress, LogoutError,
+};
 use harness_openai_codex_model::ModelError;
 
 const HELP: &str = "A local coding-agent harness
@@ -25,7 +27,18 @@ Usage: harness auth [OPTIONS] [COMMAND]
 
 Commands:
   login   Connect an account
+  logout  Disconnect an account
   status  Inspect an account connection
+
+Options:
+  -h, --help  Print help
+";
+const LOGOUT_HELP: &str = "Disconnect an account
+
+Usage: harness auth logout [OPTIONS] <PROVIDER>
+
+Providers:
+  openai-codex  OpenAI Codex through a ChatGPT subscription
 
 Options:
   -h, --help  Print help
@@ -90,6 +103,7 @@ Options:
 const ROOT_USAGE: &str = "harness [OPTIONS] [COMMAND]";
 const AUTH_USAGE: &str = "harness auth [OPTIONS] [COMMAND]";
 const LOGIN_USAGE: &str = "harness auth login [OPTIONS] <PROVIDER>";
+const LOGOUT_USAGE: &str = "harness auth logout [OPTIONS] <PROVIDER>";
 const STATUS_USAGE: &str = "harness auth status [OPTIONS] <PROVIDER>";
 const MODEL_USAGE: &str = "harness model [OPTIONS] [COMMAND]";
 const MODEL_TEST_USAGE: &str = "harness model test [OPTIONS] <PROVIDER>";
@@ -100,6 +114,7 @@ const MAX_DIAGNOSTIC_ARGUMENT_CHARS: usize = 256;
 fn main() -> ExitCode {
     let arguments: Vec<_> = env::args_os().skip(1).collect();
     let mut login = ProductionLogin;
+    let mut logout = ProductionLogout;
     let mut status = ProductionStatus;
     let mut model = ProductionModel;
     let completion = run_application(
@@ -107,6 +122,7 @@ fn main() -> ExitCode {
         &mut io::stdout(),
         &mut io::stderr(),
         &mut login,
+        &mut logout,
         &mut status,
         &mut model,
     );
@@ -114,6 +130,7 @@ fn main() -> ExitCode {
 }
 
 struct ProductionLogin;
+struct ProductionLogout;
 struct ProductionStatus;
 struct ProductionModel;
 
@@ -126,6 +143,10 @@ trait LoginAction {
 
 trait StatusAction {
     fn status_openai_codex(&mut self) -> Result<(), CredentialReadError>;
+}
+
+trait LogoutAction {
+    fn logout_openai_codex(&mut self) -> Result<(), LogoutError>;
 }
 
 trait ModelAction {
@@ -151,6 +172,12 @@ impl LoginAction for ProductionLogin {
 impl StatusAction for ProductionStatus {
     fn status_openai_codex(&mut self) -> Result<(), CredentialReadError> {
         harness_openai_codex_auth::with_authorized_credential(|_| ())
+    }
+}
+
+impl LogoutAction for ProductionLogout {
+    fn logout_openai_codex(&mut self) -> Result<(), LogoutError> {
+        harness_openai_codex_auth::logout()
     }
 }
 
@@ -194,6 +221,8 @@ enum Command<'a> {
     AuthHelp,
     LoginHelp,
     LoginOpenAiCodex,
+    LogoutHelp,
+    LogoutOpenAiCodex,
     StatusHelp,
     StatusOpenAiCodex,
     ModelHelp,
@@ -210,6 +239,7 @@ fn run_application(
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
     login: &mut dyn LoginAction,
+    logout: &mut dyn LogoutAction,
     status: &mut dyn StatusAction,
     model: &mut dyn ModelAction,
 ) -> Completion {
@@ -225,6 +255,8 @@ fn run_application(
         Command::AuthHelp => Completion::new(ExitCode::SUCCESS, write!(stdout, "{AUTH_HELP}")),
         Command::LoginHelp => Completion::new(ExitCode::SUCCESS, write!(stdout, "{LOGIN_HELP}")),
         Command::LoginOpenAiCodex => run_login(stdout, stderr, login),
+        Command::LogoutHelp => Completion::new(ExitCode::SUCCESS, write!(stdout, "{LOGOUT_HELP}")),
+        Command::LogoutOpenAiCodex => run_logout(stdout, stderr, logout),
         Command::StatusHelp => Completion::new(ExitCode::SUCCESS, write!(stdout, "{STATUS_HELP}")),
         Command::StatusOpenAiCodex => run_status(stdout, stderr, status),
         Command::ModelHelp => Completion::new(ExitCode::SUCCESS, write!(stdout, "{MODEL_HELP}")),
@@ -267,6 +299,21 @@ fn parse_auth(arguments: &[OsString]) -> Command<'_> {
     };
     if is_help(second) {
         return Command::AuthHelp;
+    }
+    if second == OsStr::new("logout") {
+        let Some(third) = arguments.get(2) else {
+            return Command::LogoutHelp;
+        };
+        if is_help(third) {
+            return Command::LogoutHelp;
+        }
+        if third != OsStr::new("openai-codex") {
+            return usage_error(third, LOGOUT_USAGE);
+        }
+        if let Some(trailing) = arguments.get(3) {
+            return usage_error(trailing, LOGOUT_USAGE);
+        }
+        return Command::LogoutOpenAiCodex;
     }
     if second == OsStr::new("status") {
         let Some(third) = arguments.get(2) else {
@@ -439,6 +486,20 @@ fn run_status(
     }
 }
 
+fn run_logout(
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+    logout: &mut dyn LogoutAction,
+) -> Completion {
+    match logout.logout_openai_codex() {
+        Ok(()) => Completion::new(
+            ExitCode::SUCCESS,
+            writeln!(stdout, "OpenAI Codex is disconnected."),
+        ),
+        Err(error) => Completion::new(ExitCode::FAILURE, writeln!(stderr, "error: {error}")),
+    }
+}
+
 fn run_model_test(
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
@@ -595,6 +656,18 @@ mod tests {
         calls: usize,
     }
 
+    struct FakeLogout {
+        result: Result<(), LogoutError>,
+        calls: usize,
+    }
+
+    impl LogoutAction for FakeLogout {
+        fn logout_openai_codex(&mut self) -> Result<(), LogoutError> {
+            self.calls += 1;
+            self.result
+        }
+    }
+
     impl StatusAction for FakeStatus {
         fn status_openai_codex(&mut self) -> Result<(), CredentialReadError> {
             self.calls += 1;
@@ -660,6 +733,13 @@ mod tests {
         }
     }
 
+    fn fake_logout_success() -> FakeLogout {
+        FakeLogout {
+            result: Ok(()),
+            calls: 0,
+        }
+    }
+
     fn run(arguments: &[&str], login: &mut FakeLogin) -> (ExitCode, String, String) {
         run_with_model(arguments, login, &mut fake_model_success())
     }
@@ -669,14 +749,31 @@ mod tests {
         login: &mut FakeLogin,
         model: &mut FakeModel,
     ) -> (ExitCode, String, String) {
-        run_with_actions(arguments, login, &mut fake_status_success(), model)
+        run_with_actions(
+            arguments,
+            login,
+            &mut fake_logout_success(),
+            &mut fake_status_success(),
+            model,
+        )
     }
 
     fn run_with_status(arguments: &[&str], status: &mut FakeStatus) -> (ExitCode, String, String) {
         run_with_actions(
             arguments,
             &mut fake_success(),
+            &mut fake_logout_success(),
             status,
+            &mut fake_model_success(),
+        )
+    }
+
+    fn run_with_logout(arguments: &[&str], logout: &mut FakeLogout) -> (ExitCode, String, String) {
+        run_with_actions(
+            arguments,
+            &mut fake_success(),
+            logout,
+            &mut fake_status_success(),
             &mut fake_model_success(),
         )
     }
@@ -684,14 +781,22 @@ mod tests {
     fn run_with_actions(
         arguments: &[&str],
         login: &mut FakeLogin,
+        logout: &mut FakeLogout,
         status: &mut FakeStatus,
         model: &mut FakeModel,
     ) -> (ExitCode, String, String) {
         let arguments: Vec<_> = arguments.iter().map(OsString::from).collect();
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
-        let completion =
-            run_application(&arguments, &mut stdout, &mut stderr, login, status, model);
+        let completion = run_application(
+            &arguments,
+            &mut stdout,
+            &mut stderr,
+            login,
+            logout,
+            status,
+            model,
+        );
         let status = complete(completion);
         (
             status,
@@ -749,6 +854,85 @@ mod tests {
                 "Opening your browser to connect OpenAI Codex.\nIf it does not open, visit: https://auth.openai.com/oauth/authorize?state={STATE}&code_challenge=challenge\n"
             )
         );
+    }
+
+    #[test]
+    fn only_the_exact_logout_command_invokes_the_action() {
+        for arguments in [
+            &[][..],
+            &["auth"][..],
+            &["auth", "logout"][..],
+            &["auth", "logout", "-h"][..],
+            &["auth", "logout", "--help", "ignored"][..],
+            &["auth", "logout", "other"][..],
+            &["auth", "logout", "--"][..],
+            &["auth", "logout", "openai-codex", "extra"][..],
+            &["auth", "logout", "openai-codex", "--help"][..],
+        ] {
+            let mut logout = fake_logout_success();
+            let _ = run_with_logout(arguments, &mut logout);
+            assert_eq!(logout.calls, 0, "unexpected invocation for {arguments:?}");
+        }
+
+        let mut logout = fake_logout_success();
+        let (exit, stdout, stderr) =
+            run_with_logout(&["auth", "logout", "openai-codex"], &mut logout);
+        assert_eq!(logout.calls, 1);
+        assert_eq!(exit, ExitCode::SUCCESS);
+        assert_eq!(stdout, "OpenAI Codex is disconnected.\n");
+        assert!(stderr.is_empty());
+        for secret in [
+            ACCESS_TOKEN,
+            REFRESH_TOKEN,
+            ID_TOKEN,
+            CALLBACK_CODE,
+            VERIFIER,
+            ACCOUNT_ID,
+            EMAIL,
+            PLAN,
+            EXPIRY,
+        ] {
+            assert!(!stdout.contains(secret));
+        }
+    }
+
+    #[test]
+    fn logout_errors_preserve_the_complete_redacted_taxonomy() {
+        for (error, diagnostic) in [
+            (
+                LogoutError::UnsupportedPlatform,
+                "error: OpenAI Codex credentials are supported only on macOS\n",
+            ),
+            (
+                LogoutError::StoreUnavailable,
+                "error: the OpenAI Codex credential store is unavailable\n",
+            ),
+        ] {
+            let mut logout = FakeLogout {
+                result: Err(error),
+                calls: 0,
+            };
+            let (exit, stdout, stderr) =
+                run_with_logout(&["auth", "logout", "openai-codex"], &mut logout);
+
+            assert_eq!(logout.calls, 1);
+            assert_eq!(exit, ExitCode::FAILURE);
+            assert!(stdout.is_empty());
+            assert_eq!(stderr, diagnostic);
+            for secret in [
+                ACCESS_TOKEN,
+                REFRESH_TOKEN,
+                ID_TOKEN,
+                CALLBACK_CODE,
+                VERIFIER,
+                ACCOUNT_ID,
+                EMAIL,
+                PLAN,
+                EXPIRY,
+            ] {
+                assert!(!stderr.contains(secret));
+            }
+        }
     }
 
     #[test]
@@ -1027,6 +1211,7 @@ mod tests {
             &mut FailedWriter,
             &mut stderr,
             &mut fake_success(),
+            &mut fake_logout_success(),
             &mut fake_status_success(),
             &mut model,
         );
@@ -1165,6 +1350,7 @@ mod tests {
             &mut Vec::new(),
             &mut BrokenWriter,
             &mut success,
+            &mut fake_logout_success(),
             &mut fake_status_success(),
             &mut fake_model_success(),
         );
@@ -1180,6 +1366,7 @@ mod tests {
             &mut Vec::new(),
             &mut BrokenWriter,
             &mut failure,
+            &mut fake_logout_success(),
             &mut fake_status_success(),
             &mut fake_model_success(),
         );
@@ -1191,10 +1378,67 @@ mod tests {
             &mut BrokenWriter,
             &mut Vec::new(),
             &mut success,
+            &mut fake_logout_success(),
             &mut fake_status_success(),
             &mut fake_model_success(),
         );
         assert_eq!(complete(completion), ExitCode::SUCCESS);
+    }
+
+    #[test]
+    fn logout_output_failures_preserve_the_intended_status_and_single_delete() {
+        let arguments: Vec<_> = ["auth", "logout", "openai-codex"]
+            .into_iter()
+            .map(OsString::from)
+            .collect();
+
+        let mut logout = fake_logout_success();
+        let mut stderr = Vec::new();
+        let completion = run_application(
+            &arguments,
+            &mut BrokenWriter,
+            &mut stderr,
+            &mut fake_success(),
+            &mut logout,
+            &mut fake_status_success(),
+            &mut fake_model_success(),
+        );
+        assert_eq!(complete(completion), ExitCode::SUCCESS);
+        assert_eq!(logout.calls, 1);
+        assert!(stderr.is_empty());
+
+        let mut logout = fake_logout_success();
+        let mut stderr = Vec::new();
+        let completion = run_application(
+            &arguments,
+            &mut FailedWriter,
+            &mut stderr,
+            &mut fake_success(),
+            &mut logout,
+            &mut fake_status_success(),
+            &mut fake_model_success(),
+        );
+        assert_eq!(complete(completion), ExitCode::FAILURE);
+        assert_eq!(logout.calls, 1);
+        assert!(stderr.is_empty());
+
+        let mut logout = FakeLogout {
+            result: Err(LogoutError::StoreUnavailable),
+            calls: 0,
+        };
+        let mut stdout = Vec::new();
+        let completion = run_application(
+            &arguments,
+            &mut stdout,
+            &mut BrokenWriter,
+            &mut fake_success(),
+            &mut logout,
+            &mut fake_status_success(),
+            &mut fake_model_success(),
+        );
+        assert_eq!(complete(completion), ExitCode::FAILURE);
+        assert_eq!(logout.calls, 1);
+        assert!(stdout.is_empty());
     }
 
     #[test]
@@ -1211,6 +1455,7 @@ mod tests {
             &mut BrokenWriter,
             &mut stderr,
             &mut fake_success(),
+            &mut fake_logout_success(),
             &mut status,
             &mut fake_model_success(),
         );
@@ -1225,6 +1470,7 @@ mod tests {
             &mut FailedWriter,
             &mut stderr,
             &mut fake_success(),
+            &mut fake_logout_success(),
             &mut status,
             &mut fake_model_success(),
         );
@@ -1242,6 +1488,7 @@ mod tests {
             &mut stdout,
             &mut BrokenWriter,
             &mut fake_success(),
+            &mut fake_logout_success(),
             &mut status,
             &mut fake_model_success(),
         );
@@ -1262,6 +1509,7 @@ mod tests {
                 &mut BrokenWriter,
                 &mut Vec::new(),
                 &mut fake_success(),
+                &mut fake_logout_success(),
                 &mut fake_status_success(),
                 &mut fake_model_success(),
             );
@@ -1273,6 +1521,7 @@ mod tests {
                 &mut FailedWriter,
                 &mut stderr,
                 &mut fake_success(),
+                &mut fake_logout_success(),
                 &mut fake_status_success(),
                 &mut fake_model_success(),
             );
@@ -1284,6 +1533,7 @@ mod tests {
                 &mut FailedWriter,
                 &mut FailedWriter,
                 &mut fake_success(),
+                &mut fake_logout_success(),
                 &mut fake_status_success(),
                 &mut fake_model_success(),
             );
@@ -1306,6 +1556,7 @@ mod tests {
             &mut Vec::new(),
             &mut BrokenWriter,
             &mut fake_success(),
+            &mut fake_logout_success(),
             &mut fake_status_success(),
             &mut failed_model,
         );
