@@ -28,6 +28,11 @@ fn workflows() -> Vec<(String, String)> {
     workflows
 }
 
+fn dependabot_workflow() -> String {
+    let path = repository_root().join(".github/workflows/dependabot-auto-merge.yml");
+    fs::read_to_string(path).expect("read Dependabot auto-merge workflow")
+}
+
 fn workflow_step<'a>(workflow: &'a str, name: &str) -> &'a str {
     let marker = format!("      - name: {name}\n");
     let start = workflow
@@ -145,4 +150,30 @@ fn repository_security_workflows_keep_all_expected_gates() {
     assert!(dependency.contains("cargo audit --file Cargo.lock --deny warnings"));
     assert!(dependency.contains("actions/dependency-review-action@"));
     assert!(dependency.contains("fail-on-severity: low"));
+}
+
+#[test]
+fn dependabot_auto_merge_only_accepts_same_repository_bot_pull_requests() {
+    let workflow = dependabot_workflow();
+
+    assert!(workflow.contains("pull_request:"));
+    assert!(workflow.contains("github.event.pull_request.user.login == 'dependabot[bot]'"));
+    assert!(
+        workflow.contains("github.event.pull_request.head.repo.full_name == github.repository")
+    );
+    assert!(workflow.contains("github.event.pull_request.draft == false"));
+    assert!(!workflow.contains("pull_request_target:"));
+    assert!(!workflow.contains("actions/checkout"));
+    assert!(!workflow.contains("secrets."));
+}
+
+#[test]
+fn dependabot_auto_merge_grants_only_merge_permissions_and_forces_squash() {
+    let workflow = dependabot_workflow();
+
+    assert!(workflow.contains("permissions: {}"));
+    assert!(workflow.contains("permissions:\n      contents: write\n      pull-requests: write"));
+    assert!(workflow.contains("gh pr merge --repo \"$GH_REPO\" --auto --squash \"$PR_NUMBER\""));
+    assert!(!workflow.contains("--merge "));
+    assert!(!workflow.contains("--rebase "));
 }
