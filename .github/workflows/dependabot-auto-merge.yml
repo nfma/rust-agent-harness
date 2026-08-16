@@ -1,31 +1,31 @@
-name: Dependabot auto-merge
+name: Auto-merge eligibility signal
 
 on:
   pull_request:
-    types: [opened, reopened, synchronize, ready_for_review]
+    types:
+      - opened
+      - reopened
+      - synchronize
+      - ready_for_review
+      - converted_to_draft
+      - labeled
+      - unlabeled
+  pull_request_review:
+    types: [submitted, edited, dismissed]
+  pull_request_review_comment:
+    types: [created, edited, deleted]
 
 permissions: {}
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
+  group: auto-merge-signal-${{ github.event.pull_request.number }}
   cancel-in-progress: true
 
 jobs:
-  enable-auto-merge:
-    name: Enable squash auto-merge
-    if: >-
-      github.event.pull_request.user.login == 'dependabot[bot]' &&
-      github.event.pull_request.head.repo.full_name == github.repository &&
-      github.event.pull_request.draft == false
+  signal:
+    name: Record eligibility event
     runs-on: ubuntu-latest
     timeout-minutes: 5
-    permissions:
-      contents: write
-      pull-requests: write
     steps:
-      - name: Enable squash auto-merge
-        env:
-          GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-        run: gh pr merge --repo "$GH_REPO" --auto --squash "$PR_NUMBER"
+      - name: Record event
+        run: echo "Eligibility is evaluated by the default-branch reconciler."
