@@ -1,6 +1,6 @@
 # Rust agent harness
 
-This repository contains a runnable CLI, native OpenAI Codex account login and local auth status on macOS, a one-shot OpenAI Codex question, and a fixed model connection diagnostic. The remaining credential lifecycle, conversations, MCP, tools, skills, and the TUI are intentionally deferred.
+This repository contains a runnable CLI, native OpenAI Codex account login, local auth status and logout on macOS, a one-shot OpenAI Codex question, and a fixed model connection diagnostic. Credential refresh and rotation, conversations, MCP, tools, skills, and the TUI are intentionally deferred.
 
 It requires Rust 1.85 or newer.
 
@@ -26,6 +26,14 @@ cargo run --quiet --locked -p harness-cli -- auth status openai-codex
 
 The command reads and validates the harness-owned credential without refreshing or changing it. A usable record prints exactly `OpenAI Codex is connected.`; missing, expired, invalid, unsupported, and unreadable records return the existing redacted credential diagnostic. This is a point-in-time local readiness check, not a provider reachability or subscription entitlement check, and it prints no account metadata.
 
+Disconnect the harness from OpenAI Codex locally:
+
+```sh
+cargo run --quiet --locked -p harness-cli -- auth logout openai-codex
+```
+
+The command immediately deletes only the harness-owned `rust-agent-harness` / `openai-codex:default` Keychain item without reading it. It is idempotent: both a deleted and an already-absent item print exactly `OpenAI Codex is disconnected.` and exit successfully. This is local logout only; it does not contact OpenAI, revoke tokens held elsewhere, or end a ChatGPT session. Reconnect with the existing browser login command.
+
 Test that stored connection with one fixed `gpt-5.5` Responses request:
 
 ```sh
@@ -41,7 +49,7 @@ cargo run --quiet --locked -p harness-cli -- ask openai-codex \
 
 Both model commands read and validate the harness-owned credential without refreshing or changing it, wait for `response.completed`, and then write terminal-safe buffered assistant text once. Terminal and Unicode bidi controls become visible `\u{...}` escapes; all other Unicode, including other invisible format characters, is preserved byte-for-byte. This is not a general confusable or invisible-text detector. `ask` accepts exactly one non-empty UTF-8 prompt of at most 32 KiB. It does not read stdin or files, accept model selection, retain a session, expose streaming output, or enable tools. Because the prompt is a positional argument, it may be recorded in shell history; use it only for ordinary questions and known-safe snippets.
 
-Running the status command against an existing connected account forms an opt-in local Keychain smoke test. Login followed by either model command forms an opt-in live provider smoke test requiring a browser, a ChatGPT subscription with Codex access, Keychain approval, and one paid or included-plan model call. Default tests use deterministic fakes and an in-memory credential store; they never start live OAuth, contact OpenAI, or access the real Keychain.
+Running the status command against an existing connected account forms an opt-in local Keychain smoke test. A logout smoke temporarily destroys the harness-owned connection and must include browser login and a final successful status check to restore and verify access. Login followed by either model command forms an opt-in live provider smoke test requiring a browser, a ChatGPT subscription with Codex access, Keychain approval, and one paid or included-plan model call. Default tests use deterministic fakes and an in-memory credential store; they never start live OAuth, contact OpenAI, or access the real Keychain.
 
 Verify the workspace:
 

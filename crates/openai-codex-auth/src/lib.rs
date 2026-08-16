@@ -20,7 +20,7 @@ use credential::SystemClock;
 #[cfg(any(target_os = "macos", test))]
 use credential::{Clock, CredentialRecord};
 #[cfg(any(target_os = "macos", test))]
-use keychain::{CredentialReader, CredentialStore};
+use keychain::{CredentialDeleter, CredentialReader, CredentialStore, DeleteOutcome};
 #[cfg(any(target_os = "macos", test))]
 use oauth::{ExchangeConfig, ExchangeError};
 #[cfg(any(target_os = "macos", test))]
@@ -179,6 +179,45 @@ impl fmt::Display for CredentialReadError {
 }
 
 impl std::error::Error for CredentialReadError {}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LogoutError {
+    UnsupportedPlatform,
+    StoreUnavailable,
+}
+
+impl fmt::Display for LogoutError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::UnsupportedPlatform => "OpenAI Codex credentials are supported only on macOS",
+            Self::StoreUnavailable => "the OpenAI Codex credential store is unavailable",
+        })
+    }
+}
+
+impl std::error::Error for LogoutError {}
+
+pub fn logout() -> Result<(), LogoutError> {
+    #[cfg(target_os = "macos")]
+    {
+        logout_with(&keychain::MacOsKeychain)
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        Err(LogoutError::UnsupportedPlatform)
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn logout_with(deleter: &dyn CredentialDeleter) -> Result<(), LogoutError> {
+    match deleter
+        .delete()
+        .map_err(|_| LogoutError::StoreUnavailable)?
+    {
+        DeleteOutcome::Deleted | DeleteOutcome::Absent => Ok(()),
+    }
+}
 
 pub fn with_authorized_credential<T>(
     operation: impl FnOnce(&AuthorizedCredential) -> T,
@@ -418,6 +457,19 @@ mod tests {
         reads: Cell<usize>,
     }
 
+    struct FakeDeleter {
+        result: Result<DeleteOutcome, StoreError>,
+        calls: Cell<usize>,
+        unrelated_record: Vec<u8>,
+    }
+
+    impl CredentialDeleter for FakeDeleter {
+        fn delete(&self) -> Result<DeleteOutcome, StoreError> {
+            self.calls.set(self.calls.get() + 1);
+            self.result
+        }
+    }
+
     impl CredentialReader for MemoryReader {
         fn read(&self) -> Result<Option<Vec<u8>>, keychain::StoreError> {
             self.reads.set(self.reads.get() + 1);
@@ -453,6 +505,43 @@ mod tests {
             fail: false,
             reads: Cell::new(0),
         }
+    }
+
+    fn fake_deleter(result: Result<DeleteOutcome, StoreError>) -> FakeDeleter {
+        FakeDeleter {
+            result,
+            calls: Cell::new(0),
+            unrelated_record: b"unrelated-credential-sentinel".to_vec(),
+        }
+    }
+
+    #[test]
+    fn deleted_and_absent_logout_outcomes_succeed_once_without_touching_neighbours() {
+        for outcome in [DeleteOutcome::Deleted, DeleteOutcome::Absent] {
+            let deleter = fake_deleter(Ok(outcome));
+
+            assert_eq!(logout_with(&deleter), Ok(()));
+            assert_eq!(deleter.calls.get(), 1);
+            assert_eq!(deleter.unrelated_record, b"unrelated-credential-sentinel");
+        }
+    }
+
+    #[test]
+    fn logout_store_failure_is_redacted_and_attempted_once() {
+        let deleter = fake_deleter(Err(StoreError));
+
+        let result = logout_with(&deleter);
+
+        assert_eq!(result, Err(LogoutError::StoreUnavailable));
+        assert_eq!(deleter.calls.get(), 1);
+        let rendered = format!("{:?} {}", result.unwrap_err(), result.unwrap_err());
+        assert!(!rendered.contains("unrelated-credential-sentinel"));
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn public_logout_is_unsupported_without_macos_keychain_access() {
+        assert_eq!(logout(), Err(LogoutError::UnsupportedPlatform));
     }
 
     enum BrowserBehavior {

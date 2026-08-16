@@ -19,7 +19,18 @@ Usage: harness auth [OPTIONS] [COMMAND]
 
 Commands:
   login   Connect an account
+  logout  Disconnect an account
   status  Inspect an account connection
+
+Options:
+  -h, --help  Print help
+";
+const LOGOUT_HELP: &str = "Disconnect an account
+
+Usage: harness auth logout [OPTIONS] <PROVIDER>
+
+Providers:
+  openai-codex  OpenAI Codex through a ChatGPT subscription
 
 Options:
   -h, --help  Print help
@@ -174,6 +185,18 @@ fn nested_help_is_available_and_terminal() {
     }
 
     for arguments in [
+        &["auth", "logout"][..],
+        &["auth", "logout", "-h"][..],
+        &["auth", "logout", "--help", "ignored"][..],
+    ] {
+        let output = run(arguments);
+
+        assert!(output.status.success());
+        assert_eq!(String::from_utf8_lossy(&output.stdout), LOGOUT_HELP);
+        assert!(output.stderr.is_empty());
+    }
+
+    for arguments in [
         &["auth", "status"][..],
         &["auth", "status", "-h"][..],
         &["auth", "status", "--help", "ignored"][..],
@@ -218,6 +241,21 @@ fn invalid_command_shapes_print_bounded_usage_diagnostics() {
             &["auth", "login", "openai-codex", "extra"][..],
             "extra",
             "harness auth login [OPTIONS] <PROVIDER>",
+        ),
+        (
+            &["auth", "logout", "unknown"][..],
+            "unknown",
+            "harness auth logout [OPTIONS] <PROVIDER>",
+        ),
+        (
+            &["auth", "logout", "openai-codex", "extra"][..],
+            "extra",
+            "harness auth logout [OPTIONS] <PROVIDER>",
+        ),
+        (
+            &["auth", "logout", "openai-codex", "--help"][..],
+            "--help",
+            "harness auth logout [OPTIONS] <PROVIDER>",
         ),
         (
             &["auth", "status", "unknown"][..],
@@ -344,6 +382,7 @@ fn double_dash_is_reported_as_invalid_at_each_level() {
         &["--"][..],
         &["auth", "--"][..],
         &["auth", "login", "--"][..],
+        &["auth", "logout", "--"][..],
         &["auth", "status", "--"][..],
         &["model", "--"][..],
         &["model", "test", "--"][..],
@@ -390,6 +429,19 @@ fn non_utf8_argument_prints_a_diagnostic() {
     assert_eq!(
         String::from_utf8_lossy(&output.stderr),
         "error: unexpected argument '�'\n\nUsage: harness auth status [OPTIONS] <PROVIDER>\n\nFor more information, try '--help'.\n"
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_harness"))
+        .args(["auth", "logout"])
+        .arg(OsString::from_vec(vec![0xff]))
+        .output()
+        .expect("harness should run");
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr),
+        "error: unexpected argument '�'\n\nUsage: harness auth logout [OPTIONS] <PROVIDER>\n\nFor more information, try '--help'.\n"
     );
 
     let output = Command::new(env!("CARGO_BIN_EXE_harness"))
@@ -453,6 +505,13 @@ fn closed_output_streams_do_not_panic() {
         .status()
         .expect("harness should run");
     assert!(status_help.success());
+
+    let logout_help = Command::new(env!("CARGO_BIN_EXE_harness"))
+        .args(["auth", "logout", "--help"])
+        .stdout(closed_stream())
+        .status()
+        .expect("harness should run");
+    assert!(logout_help.success());
 }
 
 #[test]
@@ -476,4 +535,34 @@ fn production_status_discards_the_opaque_credential_capability() {
         1
     );
     assert!(!implementation.contains("authorize("));
+}
+
+#[test]
+fn production_logout_calls_only_the_concrete_auth_operation() {
+    let source = include_str!("../src/main.rs");
+    let (_, implementation) = source
+        .split_once("impl LogoutAction for ProductionLogout {")
+        .expect("production logout implementation should exist");
+    let (implementation, _) = implementation
+        .split_once("\n}\n")
+        .expect("production logout implementation should be bounded");
+
+    assert_eq!(
+        source
+            .matches("harness_openai_codex_auth::logout()")
+            .count(),
+        1
+    );
+    assert_eq!(
+        implementation
+            .matches("harness_openai_codex_auth::logout()")
+            .count(),
+        1
+    );
+    for forbidden in ["with_authorized_credential", "login(", "authorize("] {
+        assert!(
+            !implementation.contains(forbidden),
+            "production logout must not contain {forbidden}"
+        );
+    }
 }
