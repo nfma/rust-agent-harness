@@ -1141,6 +1141,8 @@ mod tests {
             ModelError::CredentialStoreUnavailable,
             ModelError::InvalidCredential,
             ModelError::ExpiredCredential,
+            ModelError::CredentialRefreshBusy,
+            ModelError::CredentialRefreshUnavailable,
             ModelError::Unavailable,
             ModelError::UnexpectedProviderResponse,
             ModelError::ConnectionRejected,
@@ -1179,6 +1181,45 @@ mod tests {
             ] {
                 assert!(!combined.contains(secret));
             }
+        }
+    }
+
+    #[test]
+    fn credential_refresh_errors_have_exact_diagnostics_for_both_model_commands() {
+        for (error, message) in [
+            (
+                ModelError::CredentialRefreshBusy,
+                "OpenAI Codex credential refresh is already in progress; try again",
+            ),
+            (
+                ModelError::CredentialRefreshUnavailable,
+                "OpenAI Codex credential refresh is temporarily unavailable; try again",
+            ),
+        ] {
+            let mut model = FakeModel {
+                result: Err(error),
+                calls: 0,
+                ask_result: Err(error),
+                ask_calls: 0,
+                prompts: Vec::new(),
+            };
+            let (status, stdout, stderr) = run_with_model(
+                &["model", "test", "openai-codex"],
+                &mut fake_success(),
+                &mut model,
+            );
+            assert_eq!(status, ExitCode::FAILURE);
+            assert!(stdout.is_empty());
+            assert_eq!(stderr, format!("error: {message}\n"));
+
+            let (status, stdout, stderr) = run_with_model(
+                &["ask", "openai-codex", "safe prompt"],
+                &mut fake_success(),
+                &mut model,
+            );
+            assert_eq!(status, ExitCode::FAILURE);
+            assert!(stdout.is_empty());
+            assert_eq!(stderr, format!("error: {message}\n"));
         }
     }
 

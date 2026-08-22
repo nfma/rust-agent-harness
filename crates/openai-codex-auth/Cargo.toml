@@ -8,6 +8,7 @@ publish = false
 
 [dependencies]
 base64 = "0.23.1"
+fs4 = "1.1"
 rand = "0.10.2"
 reqwest = { version = "0.12.12", default-features = false, features = ["blocking", "rustls-tls"] }
 serde = { version = "1.0.217", features = ["derive"] }
@@ -18,4 +19,5 @@ url = "2.5.4"
 webbrowser = "1.0.3"
 
 [target.'cfg(target_os = "macos")'.dependencies]
+directories = "6"
 security-framework = "3.1.0"
