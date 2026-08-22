@@ -9,6 +9,7 @@ publish = false
 [dependencies]
 harness-openai-codex-auth = { path = "../openai-codex-auth" }
 harness-openai-codex-model = { path = "../openai-codex-model" }
+harness-session-log = { path = "../harness-session-log" }
 
 [[bin]]
 name = "harness"

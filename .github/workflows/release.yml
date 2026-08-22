@@ -108,6 +108,27 @@ jobs:
       - name: Run tests
         run: cargo test --workspace --locked
 
+  linux_quality:
+    name: Linux quality gate
+    needs: release_gate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --no-self-update
+          rustup default "$RUST_TOOLCHAIN"
+
+      - name: Run Linux workspace tests
+        run: cargo test --workspace --all-targets --locked
+
   stable_quality:
     name: Current stable compatibility
     needs: release_gate
@@ -137,6 +158,7 @@ jobs:
     needs:
       - release_gate
       - quality
+      - linux_quality
       - stable_quality
     runs-on: macos-15
     timeout-minutes: 15

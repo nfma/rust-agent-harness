@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/harness-cli",
+    "crates/harness-session-log",
     "crates/openai-codex-auth",
     "crates/openai-codex-model",
 ]

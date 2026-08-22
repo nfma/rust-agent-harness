@@ -1,6 +1,6 @@
 # Rust agent harness
 
-This repository contains a runnable CLI, native OpenAI Codex account login and credential continuity on macOS, local auth status and logout, a one-shot OpenAI Codex question, and a fixed model connection diagnostic. Conversations, MCP, tools, skills, and the TUI are intentionally deferred.
+This repository contains a runnable CLI, native OpenAI Codex account login and credential continuity on macOS, local auth status and logout, a retained one-shot OpenAI Codex question, and a fixed model connection diagnostic. Multi-turn conversations, MCP, tools, skills, and the TUI are intentionally deferred.
 
 It requires Rust 1.85 or newer.
 
@@ -47,6 +47,20 @@ cargo run --quiet --locked -p harness-cli -- ask openai-codex \
   "Explain in three bullets when Rust's Arc<Mutex<T>> is appropriate."
 ```
 
+Every valid `ask` creates a private versioned JSONL session before contacting the model and prints its 32-character identifier to stderr as `Session: <id>`. Successful and failed asks are retained locally by default. A session contains the prompt, completed answer or fixed sanitized failure, creation and entry timestamps, and the initial working directory when it is available and valid Unicode.
+
+Inspect a known session without contacting OpenAI or reading the Keychain:
+
+```sh
+cargo run --quiet --locked -p harness-cli -- session show <session-id>
+```
+
+Session files remain until you manually remove them. There is no opt-out, list, delete, retention, or automatic-cleanup command in this increment, and the stderr `Session:` line is the only CLI handle. If that line is discarded or lost, the session remains on disk but cannot be reached through the CLI. Files live under:
+
+- macOS: `~/Library/Application Support/rust-agent-harness/sessions/`
+- Linux with `XDG_DATA_HOME`: `$XDG_DATA_HOME/rust-agent-harness/sessions/`
+- Linux otherwise: `~/.local/share/rust-agent-harness/sessions/`
+
 Both model commands transparently refresh a harness-owned credential when its expiry is unknown, elapsed, or within five minutes. A successful rotation is validated and saved to Keychain before the model request uses it. The first model HTTP `401` may cause one serialized refresh or adoption of another harness process's replacement and one replay; other model failures are not replayed. If refresh is permanently rejected, reconnect with the browser command:
 
 ```sh
@@ -57,7 +71,7 @@ cargo run --quiet --locked -p harness-cli -- auth login openai-codex
 
 Refresh coordination waits at most 65 seconds for another harness process. That timeout is a responsiveness cap: it does not cancel the process holding the lock, which may still be waiting for macOS Keychain interaction. Refresh and one-`401` replay paths can take materially longer than a normal one-attempt call. Excluding unbounded Keychain prompts, the combined documented transport and lock budgets can approach 430 seconds.
 
-Model commands wait for `response.completed` and then write terminal-safe buffered assistant text once. Terminal and Unicode bidi controls become visible `\u{...}` escapes; all other Unicode, including other invisible format characters, is preserved byte-for-byte. This is not a general confusable or invisible-text detector. `ask` accepts exactly one non-empty UTF-8 prompt of at most 32 KiB. It does not read stdin or files, accept model selection, retain a session, expose streaming output, or enable tools. Because the prompt is a positional argument, it may be recorded in shell history; use it only for ordinary questions and known-safe snippets.
+Model commands wait for `response.completed` and then write terminal-safe buffered assistant text once. Terminal and Unicode bidi controls become visible `\u{...}` escapes; all other Unicode, including other invisible format characters, is preserved byte-for-byte. `session show` applies the same renderer to retained prompt and answer text. This is not a general confusable or invisible-text detector. `ask` accepts exactly one non-empty UTF-8 prompt of at most 32 KiB. It does not read stdin or files, accept model selection, expose streaming output, or enable tools. Because the prompt is both a positional argument and retained local session content, use it only for ordinary questions and known-safe snippets.
 
 Running the status command against an existing connected account forms an opt-in local Keychain smoke test. A logout smoke temporarily destroys the harness-owned connection and must include browser login and a final successful status check to restore and verify access. Login followed by either model command forms an opt-in live provider smoke test requiring a browser, a ChatGPT subscription with Codex access, Keychain approval, and one paid or included-plan model call. Default tests use deterministic fake stores and endpoints plus temporary lock paths; they never start live OAuth, contact OpenAI, or access the real Keychain.
 
