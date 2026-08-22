@@ -33,7 +33,7 @@ impl Drop for TempRoot {
         if self
             .0
             .file_name()
-            .and_then(|name| name.to_str())
+            .and_then(std::ffi::OsStr::to_str)
             .is_some_and(|name| name.starts_with("rust-agent-harness-cli-integration-"))
         {
             let _ = std::fs::remove_dir_all(&self.0);
