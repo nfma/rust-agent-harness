@@ -209,7 +209,7 @@ fn permanent_error_code(body: &[u8]) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::io::{Read as _, Write as _};
+    use std::io::Write as _;
     use std::net::{Ipv4Addr, TcpListener, TcpStream};
     use std::sync::{Arc, Mutex};
     use std::thread;
