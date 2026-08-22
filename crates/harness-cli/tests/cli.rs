@@ -1,4 +1,45 @@
+#[cfg(not(target_os = "macos"))]
+use std::path::PathBuf;
 use std::process::{Command, Output};
+
+#[cfg(not(target_os = "macos"))]
+struct TempRoot(PathBuf);
+
+#[cfg(not(target_os = "macos"))]
+impl TempRoot {
+    fn new(label: &str) -> Self {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        Self(std::env::temp_dir().join(format!(
+            "rust-agent-harness-cli-integration-{label}-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        )))
+    }
+
+    fn command(&self) -> Command {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_harness"));
+        command
+            .env("HOME", self.0.join("home"))
+            .env("XDG_DATA_HOME", self.0.join("xdg"));
+        command
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+impl Drop for TempRoot {
+    fn drop(&mut self) {
+        if self
+            .0
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("rust-agent-harness-cli-integration-"))
+        {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+}
 
 const HELP: &str = "A local coding-agent harness
 
@@ -8,6 +49,15 @@ Commands:
   ask    Ask OpenAI Codex one question
   auth   Manage account authentication
   model  Exercise model connections
+  session  Inspect a retained session
+
+Retention:
+  Successful and failed valid asks are retained locally by default, including the
+  prompt, answer or fixed failure, timestamps, and working directory when available.
+  Files remain until manually removed from:
+  macOS: ~/Library/Application Support/rust-agent-harness/sessions/
+  Linux: $XDG_DATA_HOME/rust-agent-harness/sessions/ or
+         ~/.local/share/rust-agent-harness/sessions/
 
 Options:
   -h, --help     Print help
@@ -88,6 +138,47 @@ Arguments:
 Output:
   Terminal and bidi controls become visible escapes; all other Unicode is preserved,
   including other invisible format characters
+
+Retention:
+  Successful and failed valid asks are retained locally by default, including the
+  prompt, answer or fixed failure, timestamps, and working directory when available.
+  The stderr Session line is the only CLI handle. Files remain until manually removed;
+  there is no opt-out, list, delete, retention, or automatic-cleanup command.
+  macOS: ~/Library/Application Support/rust-agent-harness/sessions/
+  Linux: $XDG_DATA_HOME/rust-agent-harness/sessions/ or
+         ~/.local/share/rust-agent-harness/sessions/
+
+Options:
+  -h, --help  Print help
+";
+const SESSION_HELP: &str = "Inspect a retained session
+
+Usage: harness session [OPTIONS] [COMMAND]
+
+Commands:
+  show  Show one retained session by identifier
+
+Retention:
+  Successful and failed valid asks are retained locally by default, including the
+  prompt, answer or fixed failure, timestamps, and working directory when available.
+  The stderr Session line is the only CLI handle. Files remain until manually removed;
+  there is no opt-out, list, delete, retention, or automatic-cleanup command.
+  macOS: ~/Library/Application Support/rust-agent-harness/sessions/
+  Linux: $XDG_DATA_HOME/rust-agent-harness/sessions/ or
+         ~/.local/share/rust-agent-harness/sessions/
+
+Options:
+  -h, --help  Print help
+";
+const SESSION_SHOW_HELP: &str = "Show one retained session
+
+Usage: harness session show [OPTIONS] <SESSION_ID>
+
+Arguments:
+  <SESSION_ID>  Exactly 32 lowercase hexadecimal characters
+
+Output:
+  Prompt and answer text use the same terminal-safe rendering as ask
 
 Options:
   -h, --help  Print help
@@ -171,6 +262,19 @@ fn nested_help_is_available_and_terminal() {
         assert_eq!(String::from_utf8_lossy(&output.stdout), MODEL_TEST_HELP);
         assert!(output.stderr.is_empty());
     }
+
+    for arguments in &[&["session"][..], &["session", "--help"][..]] {
+        let output = run(arguments);
+
+        assert!(output.status.success());
+        assert_eq!(String::from_utf8_lossy(&output.stdout), SESSION_HELP);
+        assert!(output.stderr.is_empty());
+    }
+
+    let output = run(&["session", "show", "--help"]);
+    assert!(output.status.success());
+    assert_eq!(String::from_utf8_lossy(&output.stdout), SESSION_SHOW_HELP);
+    assert!(output.stderr.is_empty());
 
     for arguments in [
         &["auth", "login"][..],
@@ -297,6 +401,31 @@ fn invalid_command_shapes_print_bounded_usage_diagnostics() {
             "extra",
             "harness ask [OPTIONS] <PROVIDER> <PROMPT>",
         ),
+        (
+            &["session", "unknown"][..],
+            "unknown",
+            "harness session [OPTIONS] [COMMAND]",
+        ),
+        (
+            &["session", "show"][..],
+            "<SESSION_ID>",
+            "harness session show [OPTIONS] <SESSION_ID>",
+        ),
+        (
+            &["session", "show", "ABCDEFABCDEFABCDEFABCDEFABCDEFAB"][..],
+            "ABCDEFABCDEFABCDEFABCDEFABCDEFAB",
+            "harness session show [OPTIONS] <SESSION_ID>",
+        ),
+        (
+            &[
+                "session",
+                "show",
+                "00000000000000000000000000000000",
+                "extra",
+            ][..],
+            "extra",
+            "harness session show [OPTIONS] <SESSION_ID>",
+        ),
     ] {
         let output = run(arguments);
 
@@ -388,6 +517,8 @@ fn double_dash_is_reported_as_invalid_at_each_level() {
         &["model", "test", "--"][..],
         &["ask", "--"][..],
         &["ask", "openai-codex", "--"][..],
+        &["session", "--"][..],
+        &["session", "show", "--"][..],
     ] {
         let output = run(arguments);
 
@@ -456,6 +587,19 @@ fn non_utf8_argument_prints_a_diagnostic() {
         String::from_utf8_lossy(&output.stderr),
         "error: prompt must contain non-whitespace text and be at most 32768 bytes\n\nUsage: harness ask [OPTIONS] <PROVIDER> <PROMPT>\n\nFor more information, try '--help'.\n"
     );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_harness"))
+        .args(["session", "show"])
+        .arg(OsString::from_vec(vec![0xff]))
+        .output()
+        .expect("harness should run");
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr),
+        "error: unexpected argument '�'\n\nUsage: harness session show [OPTIONS] <SESSION_ID>\n\nFor more information, try '--help'.\n"
+    );
 }
 
 #[cfg(unix)]
@@ -498,6 +642,13 @@ fn closed_output_streams_do_not_panic() {
         .status()
         .expect("harness should run");
     assert!(ask_help.success());
+
+    let session_help = Command::new(env!("CARGO_BIN_EXE_harness"))
+        .args(["session", "--help"])
+        .stdout(closed_stream())
+        .status()
+        .expect("harness should run");
+    assert!(session_help.success());
 
     let status_help = Command::new(env!("CARGO_BIN_EXE_harness"))
         .args(["auth", "status", "--help"])
@@ -570,20 +721,63 @@ fn production_logout_calls_only_the_concrete_auth_operation() {
 #[cfg(not(target_os = "macos"))]
 #[test]
 fn production_model_commands_keep_lifecycle_failures_on_stderr() {
-    for arguments in [
-        vec!["model", "test", "openai-codex"],
-        vec!["ask", "openai-codex", "safe prompt"],
-    ] {
-        let output = Command::new(env!("CARGO_BIN_EXE_harness"))
-            .args(arguments)
-            .output()
-            .expect("harness should run");
+    let root = TempRoot::new("lifecycle");
+    let model = root
+        .command()
+        .args(["model", "test", "openai-codex"])
+        .output()
+        .expect("harness should run");
+    assert_eq!(model.status.code(), Some(1));
+    assert!(model.stdout.is_empty());
+    assert_eq!(
+        String::from_utf8(model.stderr).unwrap(),
+        "error: OpenAI Codex model calls are supported only on macOS\n"
+    );
+    assert!(!root.0.join("xdg").exists());
 
-        assert_eq!(output.status.code(), Some(1));
-        assert!(output.stdout.is_empty());
-        assert_eq!(
-            String::from_utf8(output.stderr).unwrap(),
-            "error: OpenAI Codex model calls are supported only on macOS\n"
-        );
-    }
+    let prompt = "isolated-prompt-origin-sentinel";
+    let ask = root
+        .command()
+        .args(["ask", "openai-codex", prompt])
+        .output()
+        .expect("harness should run");
+    assert_eq!(ask.status.code(), Some(1));
+    assert!(ask.stdout.is_empty());
+    let stderr = String::from_utf8(ask.stderr).unwrap();
+    let session_id = stderr
+        .strip_prefix("error: OpenAI Codex model calls are supported only on macOS\nSession: ")
+        .and_then(|value| value.strip_suffix('\n'))
+        .expect("fixed model diagnostic followed by session id");
+    assert_eq!(session_id.len(), 32);
+    assert!(
+        session_id
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    );
+
+    let sessions = root.0.join("xdg/rust-agent-harness/sessions");
+    let entries = std::fs::read_dir(&sessions)
+        .expect("isolated sessions directory")
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(entries.len(), 1);
+    let canonical = sessions.join(format!("{session_id}.jsonl"));
+    let bytes = std::fs::read_to_string(&canonical).unwrap();
+    assert!(bytes.contains(prompt));
+    assert!(bytes.contains("\"failure_code\":\"unsupported_platform\""));
+    assert!(!root.0.join("home/.local/share/rust-agent-harness").exists());
+
+    let shown = root
+        .command()
+        .args(["session", "show", session_id])
+        .output()
+        .expect("harness should run");
+    assert!(shown.status.success());
+    assert!(shown.stderr.is_empty());
+    assert_eq!(
+        String::from_utf8(shown.stdout).unwrap(),
+        format!(
+            "Session: {session_id}\nStatus: failed\nProvider: openai-codex\n\nUser:\n{prompt}\n\nFailure: OpenAI Codex model calls are supported only on macOS\n"
+        )
+    );
 }

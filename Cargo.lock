@@ -312,6 +312,7 @@ version = "0.1.0"
 dependencies = [
  "harness-openai-codex-auth",
  "harness-openai-codex-model",
+ "harness-session-log",
 ]
 
 [[package]]
@@ -342,6 +343,17 @@ dependencies = [
  "serde",
  "serde_json",
  "tiny_http",
+]
+
+[[package]]
+name = "harness-session-log"
+version = "0.1.0"
+dependencies = [
+ "directories",
+ "fs4",
+ "rand 0.10.2",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

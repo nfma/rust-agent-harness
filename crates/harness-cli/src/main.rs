@@ -7,6 +7,10 @@ use harness_openai_codex_auth::{
     ConnectedAccount, CredentialReadError, LoginError, LoginProgress, LogoutError,
 };
 use harness_openai_codex_model::ModelError;
+use harness_session_log::{
+    AppendError, CreateError, FailureCode, ProjectedTerminal, RollbackError, SessionLog,
+    SessionStatus, SessionWriter, ShowError, ShowResult, TRAILING_FRAGMENT_WARNING,
+};
 
 const HELP: &str = "A local coding-agent harness
 
@@ -16,6 +20,15 @@ Commands:
   ask    Ask OpenAI Codex one question
   auth   Manage account authentication
   model  Exercise model connections
+  session  Inspect a retained session
+
+Retention:
+  Successful and failed valid asks are retained locally by default, including the
+  prompt, answer or fixed failure, timestamps, and working directory when available.
+  Files remain until manually removed from:
+  macOS: ~/Library/Application Support/rust-agent-harness/sessions/
+  Linux: $XDG_DATA_HOME/rust-agent-harness/sessions/ or
+         ~/.local/share/rust-agent-harness/sessions/
 
 Options:
   -h, --help     Print help
@@ -97,6 +110,47 @@ Output:
   Terminal and bidi controls become visible escapes; all other Unicode is preserved,
   including other invisible format characters
 
+Retention:
+  Successful and failed valid asks are retained locally by default, including the
+  prompt, answer or fixed failure, timestamps, and working directory when available.
+  The stderr Session line is the only CLI handle. Files remain until manually removed;
+  there is no opt-out, list, delete, retention, or automatic-cleanup command.
+  macOS: ~/Library/Application Support/rust-agent-harness/sessions/
+  Linux: $XDG_DATA_HOME/rust-agent-harness/sessions/ or
+         ~/.local/share/rust-agent-harness/sessions/
+
+Options:
+  -h, --help  Print help
+";
+const SESSION_HELP: &str = "Inspect a retained session
+
+Usage: harness session [OPTIONS] [COMMAND]
+
+Commands:
+  show  Show one retained session by identifier
+
+Retention:
+  Successful and failed valid asks are retained locally by default, including the
+  prompt, answer or fixed failure, timestamps, and working directory when available.
+  The stderr Session line is the only CLI handle. Files remain until manually removed;
+  there is no opt-out, list, delete, retention, or automatic-cleanup command.
+  macOS: ~/Library/Application Support/rust-agent-harness/sessions/
+  Linux: $XDG_DATA_HOME/rust-agent-harness/sessions/ or
+         ~/.local/share/rust-agent-harness/sessions/
+
+Options:
+  -h, --help  Print help
+";
+const SESSION_SHOW_HELP: &str = "Show one retained session
+
+Usage: harness session show [OPTIONS] <SESSION_ID>
+
+Arguments:
+  <SESSION_ID>  Exactly 32 lowercase hexadecimal characters
+
+Output:
+  Prompt and answer text use the same terminal-safe rendering as ask
+
 Options:
   -h, --help  Print help
 ";
@@ -108,6 +162,8 @@ const STATUS_USAGE: &str = "harness auth status [OPTIONS] <PROVIDER>";
 const MODEL_USAGE: &str = "harness model [OPTIONS] [COMMAND]";
 const MODEL_TEST_USAGE: &str = "harness model test [OPTIONS] <PROVIDER>";
 const ASK_USAGE: &str = "harness ask [OPTIONS] <PROVIDER> <PROMPT>";
+const SESSION_USAGE: &str = "harness session [OPTIONS] [COMMAND]";
+const SESSION_SHOW_USAGE: &str = "harness session show [OPTIONS] <SESSION_ID>";
 const MAX_PROMPT_BYTES: usize = 32 * 1024;
 const MAX_DIAGNOSTIC_ARGUMENT_CHARS: usize = 256;
 
@@ -117,14 +173,19 @@ fn main() -> ExitCode {
     let mut logout = ProductionLogout;
     let mut status = ProductionStatus;
     let mut model = ProductionModel;
+    let mut session = ProductionSession::new();
+    let mut actions = ApplicationActions {
+        login: &mut login,
+        logout: &mut logout,
+        status: &mut status,
+        model: &mut model,
+        session: &mut session,
+    };
     let completion = run_application(
         &arguments,
         &mut io::stdout(),
         &mut io::stderr(),
-        &mut login,
-        &mut logout,
-        &mut status,
-        &mut model,
+        &mut actions,
     );
     complete(completion)
 }
@@ -133,6 +194,13 @@ struct ProductionLogin;
 struct ProductionLogout;
 struct ProductionStatus;
 struct ProductionModel;
+struct ProductionSession {
+    log: SessionLog,
+}
+
+struct ProductionSessionWriter {
+    writer: SessionWriter,
+}
 
 trait LoginAction {
     fn login(
@@ -152,6 +220,26 @@ trait LogoutAction {
 trait ModelAction {
     fn test_openai_codex(&mut self) -> Result<String, ModelError>;
     fn ask_openai_codex(&mut self, prompt: &str) -> Result<String, ModelError>;
+}
+
+trait SessionAction {
+    fn start(&mut self, prompt: &str) -> Result<Box<dyn SessionWriteAction>, CreateError>;
+    fn show(&mut self, session_id: &str) -> Result<ShowResult, ShowError>;
+}
+
+trait SessionWriteAction {
+    fn session_id(&self) -> &str;
+    fn append_assistant(self: Box<Self>, text: &str) -> Result<(), AppendError>;
+    fn append_failure(self: Box<Self>, failure_code: FailureCode) -> Result<(), AppendError>;
+    fn rollback(self: Box<Self>) -> Result<(), RollbackError>;
+}
+
+struct ApplicationActions<'a> {
+    login: &'a mut dyn LoginAction,
+    logout: &'a mut dyn LogoutAction,
+    status: &'a mut dyn StatusAction,
+    model: &'a mut dyn ModelAction,
+    session: &'a mut dyn SessionAction,
 }
 
 enum CliLoginProgress {
@@ -191,6 +279,52 @@ impl ModelAction for ProductionModel {
     }
 }
 
+impl ProductionSession {
+    fn new() -> Self {
+        Self {
+            log: SessionLog::production(),
+        }
+    }
+
+    #[cfg(test)]
+    fn with_log(log: SessionLog) -> Self {
+        Self { log }
+    }
+}
+
+impl SessionAction for ProductionSession {
+    fn start(&mut self, prompt: &str) -> Result<Box<dyn SessionWriteAction>, CreateError> {
+        self.log.start(prompt).map(|writer| {
+            Box::new(ProductionSessionWriter { writer }) as Box<dyn SessionWriteAction>
+        })
+    }
+
+    fn show(&mut self, session_id: &str) -> Result<ShowResult, ShowError> {
+        self.log.show(session_id)
+    }
+}
+
+impl SessionWriteAction for ProductionSessionWriter {
+    fn session_id(&self) -> &str {
+        self.writer.session_id()
+    }
+
+    fn append_assistant(self: Box<Self>, text: &str) -> Result<(), AppendError> {
+        let Self { writer } = *self;
+        writer.append_assistant(text)
+    }
+
+    fn append_failure(self: Box<Self>, failure_code: FailureCode) -> Result<(), AppendError> {
+        let Self { writer } = *self;
+        writer.append_failure(failure_code)
+    }
+
+    fn rollback(self: Box<Self>) -> Result<(), RollbackError> {
+        let Self { writer } = *self;
+        writer.rollback()
+    }
+}
+
 fn map_login_progress(progress: LoginProgress) -> CliLoginProgress {
     match progress {
         LoginProgress::OpeningBrowser => CliLoginProgress::OpeningBrowser,
@@ -203,12 +337,33 @@ fn map_login_progress(progress: LoginProgress) -> CliLoginProgress {
 
 struct Completion {
     status: ExitCode,
-    output: io::Result<()>,
+    stdout: io::Result<()>,
+    stderr: io::Result<()>,
 }
 
 impl Completion {
-    fn new(status: ExitCode, output: io::Result<()>) -> Self {
-        Self { status, output }
+    fn stdout(status: ExitCode, stdout: io::Result<()>) -> Self {
+        Self {
+            status,
+            stdout,
+            stderr: Ok(()),
+        }
+    }
+
+    fn stderr(status: ExitCode, stderr: io::Result<()>) -> Self {
+        Self {
+            status,
+            stdout: Ok(()),
+            stderr,
+        }
+    }
+
+    fn streams(status: ExitCode, stdout: io::Result<()>, stderr: io::Result<()>) -> Self {
+        Self {
+            status,
+            stdout,
+            stderr,
+        }
     }
 }
 
@@ -218,6 +373,9 @@ enum Command<'a> {
     AskHelp,
     AskOpenAiCodex(&'a str),
     InvalidPrompt,
+    SessionHelp,
+    SessionShowHelp,
+    SessionShow(&'a str),
     AuthHelp,
     LoginHelp,
     LoginOpenAiCodex,
@@ -238,33 +396,43 @@ fn run_application(
     arguments: &[OsString],
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
-    login: &mut dyn LoginAction,
-    logout: &mut dyn LogoutAction,
-    status: &mut dyn StatusAction,
-    model: &mut dyn ModelAction,
+    actions: &mut ApplicationActions<'_>,
 ) -> Completion {
     match parse_command(arguments) {
-        Command::RootHelp => Completion::new(ExitCode::SUCCESS, write!(stdout, "{HELP}")),
-        Command::Version => Completion::new(
+        Command::RootHelp => Completion::stdout(ExitCode::SUCCESS, write!(stdout, "{HELP}")),
+        Command::Version => Completion::stdout(
             ExitCode::SUCCESS,
             writeln!(stdout, "harness {}", env!("CARGO_PKG_VERSION")),
         ),
-        Command::AskHelp => Completion::new(ExitCode::SUCCESS, write!(stdout, "{ASK_HELP}")),
-        Command::AskOpenAiCodex(prompt) => run_ask(stdout, stderr, model, prompt),
-        Command::InvalidPrompt => Completion::new(ExitCode::from(2), print_prompt_error(stderr)),
-        Command::AuthHelp => Completion::new(ExitCode::SUCCESS, write!(stdout, "{AUTH_HELP}")),
-        Command::LoginHelp => Completion::new(ExitCode::SUCCESS, write!(stdout, "{LOGIN_HELP}")),
-        Command::LoginOpenAiCodex => run_login(stdout, stderr, login),
-        Command::LogoutHelp => Completion::new(ExitCode::SUCCESS, write!(stdout, "{LOGOUT_HELP}")),
-        Command::LogoutOpenAiCodex => run_logout(stdout, stderr, logout),
-        Command::StatusHelp => Completion::new(ExitCode::SUCCESS, write!(stdout, "{STATUS_HELP}")),
-        Command::StatusOpenAiCodex => run_status(stdout, stderr, status),
-        Command::ModelHelp => Completion::new(ExitCode::SUCCESS, write!(stdout, "{MODEL_HELP}")),
-        Command::ModelTestHelp => {
-            Completion::new(ExitCode::SUCCESS, write!(stdout, "{MODEL_TEST_HELP}"))
+        Command::AskHelp => Completion::stdout(ExitCode::SUCCESS, write!(stdout, "{ASK_HELP}")),
+        Command::AskOpenAiCodex(prompt) => run_ask(stdout, stderr, actions, prompt),
+        Command::InvalidPrompt => Completion::stderr(ExitCode::from(2), print_prompt_error(stderr)),
+        Command::SessionHelp => {
+            Completion::stdout(ExitCode::SUCCESS, write!(stdout, "{SESSION_HELP}"))
         }
-        Command::ModelTestOpenAiCodex => run_model_test(stdout, stderr, model),
-        Command::UsageError { argument, usage } => Completion::new(
+        Command::SessionShowHelp => {
+            Completion::stdout(ExitCode::SUCCESS, write!(stdout, "{SESSION_SHOW_HELP}"))
+        }
+        Command::SessionShow(session_id) => {
+            run_session_show(stdout, stderr, actions.session, session_id)
+        }
+        Command::AuthHelp => Completion::stdout(ExitCode::SUCCESS, write!(stdout, "{AUTH_HELP}")),
+        Command::LoginHelp => Completion::stdout(ExitCode::SUCCESS, write!(stdout, "{LOGIN_HELP}")),
+        Command::LoginOpenAiCodex => run_login(stdout, stderr, actions.login),
+        Command::LogoutHelp => {
+            Completion::stdout(ExitCode::SUCCESS, write!(stdout, "{LOGOUT_HELP}"))
+        }
+        Command::LogoutOpenAiCodex => run_logout(stdout, stderr, actions.logout),
+        Command::StatusHelp => {
+            Completion::stdout(ExitCode::SUCCESS, write!(stdout, "{STATUS_HELP}"))
+        }
+        Command::StatusOpenAiCodex => run_status(stdout, stderr, actions.status),
+        Command::ModelHelp => Completion::stdout(ExitCode::SUCCESS, write!(stdout, "{MODEL_HELP}")),
+        Command::ModelTestHelp => {
+            Completion::stdout(ExitCode::SUCCESS, write!(stdout, "{MODEL_TEST_HELP}"))
+        }
+        Command::ModelTestOpenAiCodex => run_model_test(stdout, stderr, actions.model),
+        Command::UsageError { argument, usage } => Completion::stderr(
             ExitCode::from(2),
             print_usage_error(stderr, &argument, usage),
         ),
@@ -290,7 +458,55 @@ fn parse_command(arguments: &[OsString]) -> Command<'_> {
     if first == OsStr::new("model") {
         return parse_model(arguments);
     }
+    if first == OsStr::new("session") {
+        return parse_session(arguments);
+    }
     usage_error(first, ROOT_USAGE)
+}
+
+fn parse_session(arguments: &[OsString]) -> Command<'_> {
+    let Some(command) = arguments.get(1) else {
+        return Command::SessionHelp;
+    };
+    if is_help(command) {
+        return arguments.get(2).map_or(Command::SessionHelp, |trailing| {
+            usage_error(trailing, SESSION_USAGE)
+        });
+    }
+    if command != OsStr::new("show") {
+        return usage_error(command, SESSION_USAGE);
+    }
+
+    let Some(session_id) = arguments.get(2) else {
+        return Command::UsageError {
+            argument: OsString::from("<SESSION_ID>"),
+            usage: SESSION_SHOW_USAGE,
+        };
+    };
+    if is_help(session_id) {
+        return arguments
+            .get(3)
+            .map_or(Command::SessionShowHelp, |trailing| {
+                usage_error(trailing, SESSION_SHOW_USAGE)
+            });
+    }
+    if let Some(trailing) = arguments.get(3) {
+        return usage_error(trailing, SESSION_SHOW_USAGE);
+    }
+    let Some(session_id) = session_id.to_str() else {
+        return usage_error(session_id, SESSION_SHOW_USAGE);
+    };
+    if !valid_session_id(session_id) {
+        return usage_error(OsStr::new(session_id), SESSION_SHOW_USAGE);
+    }
+    Command::SessionShow(session_id)
+}
+
+fn valid_session_id(session_id: &str) -> bool {
+    session_id.len() == 32
+        && session_id
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 fn parse_auth(arguments: &[OsString]) -> Command<'_> {
@@ -457,18 +673,20 @@ fn run_login(
         ExitCode::FAILURE
     };
     if let Some(error) = output_error {
-        return Completion::new(status, Err(error));
+        return Completion::stderr(status, Err(error));
     }
 
-    let output = match result {
-        Ok(account) => writeln!(
-            stdout,
-            "Connected to OpenAI Codex as {}.",
-            account.email.as_deref().unwrap_or("your account")
+    match result {
+        Ok(account) => Completion::stdout(
+            status,
+            writeln!(
+                stdout,
+                "Connected to OpenAI Codex as {}.",
+                account.email.as_deref().unwrap_or("your account")
+            ),
         ),
-        Err(error) => writeln!(stderr, "error: {error}"),
-    };
-    Completion::new(status, output)
+        Err(error) => Completion::stderr(status, writeln!(stderr, "error: {error}")),
+    }
 }
 
 fn run_status(
@@ -477,11 +695,11 @@ fn run_status(
     status: &mut dyn StatusAction,
 ) -> Completion {
     match status.status_openai_codex() {
-        Ok(()) => Completion::new(
+        Ok(()) => Completion::stdout(
             ExitCode::SUCCESS,
             writeln!(stdout, "OpenAI Codex is connected."),
         ),
-        Err(error) => Completion::new(ExitCode::FAILURE, writeln!(stderr, "error: {error}")),
+        Err(error) => Completion::stderr(ExitCode::FAILURE, writeln!(stderr, "error: {error}")),
     }
 }
 
@@ -491,11 +709,11 @@ fn run_logout(
     logout: &mut dyn LogoutAction,
 ) -> Completion {
     match logout.logout_openai_codex() {
-        Ok(()) => Completion::new(
+        Ok(()) => Completion::stdout(
             ExitCode::SUCCESS,
             writeln!(stdout, "OpenAI Codex is disconnected."),
         ),
-        Err(error) => Completion::new(ExitCode::FAILURE, writeln!(stderr, "error: {error}")),
+        Err(error) => Completion::stderr(ExitCode::FAILURE, writeln!(stderr, "error: {error}")),
     }
 }
 
@@ -506,34 +724,172 @@ fn run_model_test(
 ) -> Completion {
     match model.test_openai_codex() {
         Ok(text) => write_model_text(stdout, stderr, &text),
-        Err(error) => Completion::new(ExitCode::FAILURE, writeln!(stderr, "error: {error}")),
+        Err(error) => Completion::stderr(ExitCode::FAILURE, writeln!(stderr, "error: {error}")),
     }
 }
 
 fn run_ask(
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
-    model: &mut dyn ModelAction,
+    actions: &mut ApplicationActions<'_>,
     prompt: &str,
 ) -> Completion {
-    match model.ask_openai_codex(prompt) {
-        Ok(text) => write_model_text(stdout, stderr, &text),
-        Err(ModelError::InvalidPrompt) => {
-            Completion::new(ExitCode::from(2), print_prompt_error(stderr))
+    let writer = match actions.session.start(prompt) {
+        Ok(writer) => writer,
+        Err(error) => {
+            return Completion::stderr(ExitCode::FAILURE, writeln!(stderr, "error: {error}"));
         }
-        Err(error) => Completion::new(ExitCode::FAILURE, writeln!(stderr, "error: {error}")),
+    };
+    let session_id = writer.session_id().to_owned();
+
+    match actions.model.ask_openai_codex(prompt) {
+        Ok(text) => {
+            let append = writer.append_assistant(&text);
+            let status = if append.is_ok() {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::FAILURE
+            };
+            let rendered = render_model_text(&text);
+            let stdout_result = stdout.write_all(rendered.as_bytes());
+            let mut stderr_result = Ok(());
+            if stdout_result
+                .as_ref()
+                .is_err_and(|error| error.kind() != ErrorKind::BrokenPipe)
+            {
+                retain_first_error(
+                    &mut stderr_result,
+                    writeln!(stderr, "error: unable to write model output"),
+                );
+            }
+            if let Err(error) = append {
+                retain_first_error(&mut stderr_result, writeln!(stderr, "error: {error}"));
+            }
+            retain_first_error(
+                &mut stderr_result,
+                writeln!(stderr, "Session: {session_id}"),
+            );
+            Completion::streams(status, stdout_result, stderr_result)
+        }
+        Err(ModelError::InvalidPrompt) => match writer.rollback() {
+            Ok(()) => Completion::stderr(ExitCode::from(2), print_prompt_error(stderr)),
+            Err(error) => Completion::stderr(ExitCode::FAILURE, writeln!(stderr, "error: {error}")),
+        },
+        Err(error) => {
+            let append = writer.append_failure(model_failure_code(error));
+            let mut stderr_result = writeln!(stderr, "error: {error}");
+            if let Err(error) = append {
+                retain_first_error(&mut stderr_result, writeln!(stderr, "error: {error}"));
+            }
+            retain_first_error(
+                &mut stderr_result,
+                writeln!(stderr, "Session: {session_id}"),
+            );
+            Completion::stderr(ExitCode::FAILURE, stderr_result)
+        }
+    }
+}
+
+fn model_failure_code(error: ModelError) -> FailureCode {
+    match error {
+        ModelError::InvalidPrompt => unreachable!("invalid prompts are rolled back"),
+        ModelError::UnsupportedPlatform => FailureCode::UnsupportedPlatform,
+        ModelError::NotConnected => FailureCode::NotConnected,
+        ModelError::CredentialStoreUnavailable => FailureCode::CredentialStoreUnavailable,
+        ModelError::InvalidCredential => FailureCode::InvalidCredential,
+        ModelError::ExpiredCredential => FailureCode::ExpiredCredential,
+        ModelError::CredentialRefreshBusy => FailureCode::CredentialRefreshBusy,
+        ModelError::CredentialRefreshUnavailable => FailureCode::CredentialRefreshUnavailable,
+        ModelError::Unavailable => FailureCode::Unavailable,
+        ModelError::UnexpectedProviderResponse => FailureCode::UnexpectedProviderResponse,
+        ModelError::ConnectionRejected => FailureCode::ConnectionRejected,
+        ModelError::AccessDenied => FailureCode::AccessDenied,
+        ModelError::RateLimited => FailureCode::RateLimited,
+        ModelError::TemporarilyUnavailable => FailureCode::TemporarilyUnavailable,
+        ModelError::Rejected => FailureCode::Rejected,
+        ModelError::InvalidProviderResponse => FailureCode::InvalidProviderResponse,
+        ModelError::CallTimedOut => FailureCode::CallTimedOut,
+        ModelError::ResponseTooLarge => FailureCode::ResponseTooLarge,
+        ModelError::ModelCallFailed => FailureCode::ModelCallFailed,
+        ModelError::EmptyResponse => FailureCode::EmptyResponse,
+    }
+}
+
+fn run_session_show(
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+    session: &mut dyn SessionAction,
+    session_id: &str,
+) -> Completion {
+    let shown = match session.show(session_id) {
+        Ok(shown) => shown,
+        Err(error) => {
+            return Completion::stderr(ExitCode::FAILURE, writeln!(stderr, "error: {error}"));
+        }
+    };
+    let rendered = render_session(&shown);
+    let stdout_result = stdout.write_all(rendered.as_bytes());
+    let mut stderr_result = Ok(());
+    if shown.has_trailing_fragment() {
+        retain_first_error(
+            &mut stderr_result,
+            writeln!(stderr, "warning: {TRAILING_FRAGMENT_WARNING}"),
+        );
+    }
+    if stdout_result
+        .as_ref()
+        .is_err_and(|error| error.kind() != ErrorKind::BrokenPipe)
+    {
+        retain_first_error(
+            &mut stderr_result,
+            writeln!(stderr, "error: unable to write session output"),
+        );
+    }
+    Completion::streams(ExitCode::SUCCESS, stdout_result, stderr_result)
+}
+
+fn render_session(shown: &ShowResult) -> String {
+    let projection = shown.projection();
+    let status = match projection.status() {
+        SessionStatus::Completed => "completed",
+        SessionStatus::Failed => "failed",
+        SessionStatus::Interrupted => "interrupted",
+    };
+    let mut rendered = format!(
+        "Session: {}\nStatus: {status}\nProvider: openai-codex\n\nUser:\n{}",
+        projection.session_id(),
+        render_model_text(projection.prompt())
+    );
+    match projection.terminal() {
+        Some(ProjectedTerminal::Assistant(answer)) => {
+            rendered.push_str("\nAssistant:\n");
+            rendered.push_str(&render_model_text(answer));
+        }
+        Some(ProjectedTerminal::Failure(failure)) => {
+            rendered.push_str("\nFailure: ");
+            rendered.push_str(&render_model_text(failure.diagnostic()));
+        }
+        None => {}
+    }
+    rendered
+}
+
+fn retain_first_error(result: &mut io::Result<()>, next: io::Result<()>) {
+    if result.is_ok() {
+        *result = next;
     }
 }
 
 fn write_model_text(stdout: &mut dyn Write, stderr: &mut dyn Write, text: &str) -> Completion {
     let rendered = render_model_text(text);
     match stdout.write_all(rendered.as_bytes()) {
-        Ok(()) => Completion::new(ExitCode::SUCCESS, Ok(())),
+        Ok(()) => Completion::stdout(ExitCode::SUCCESS, Ok(())),
         Err(error) if error.kind() == ErrorKind::BrokenPipe => {
-            Completion::new(ExitCode::SUCCESS, Err(error))
+            Completion::stdout(ExitCode::SUCCESS, Err(error))
         }
-        Err(_) => Completion::new(
+        Err(error) => Completion::streams(
             ExitCode::FAILURE,
+            Err(error),
             writeln!(stderr, "error: unable to write model output"),
         ),
     }
@@ -614,16 +970,21 @@ fn format_argument(argument: &OsStr) -> String {
 }
 
 fn complete(completion: Completion) -> ExitCode {
-    match completion.output {
-        Ok(()) => completion.status,
-        Err(error) if error.kind() == ErrorKind::BrokenPipe => completion.status,
-        Err(_) => ExitCode::FAILURE,
+    let failed_output = [completion.stdout, completion.stderr]
+        .into_iter()
+        .any(|result| result.is_err_and(|error| error.kind() != ErrorKind::BrokenPipe));
+    if failed_output && completion.status == ExitCode::SUCCESS {
+        ExitCode::FAILURE
+    } else {
+        completion.status
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::RefCell;
+    use std::rc::Rc;
 
     const STATE: &str = "state-sentinel";
     const ACCESS_TOKEN: &str = "access-token-sentinel";
@@ -635,6 +996,7 @@ mod tests {
     const EMAIL: &str = "email-sentinel";
     const PLAN: &str = "plan-sentinel";
     const EXPIRY: &str = "expiry-sentinel";
+    const SESSION_ID: &str = "11111111111111111111111111111111";
 
     struct FakeLogin {
         result: Result<ConnectedAccount, LoginError>,
@@ -648,6 +1010,7 @@ mod tests {
         ask_result: Result<String, ModelError>,
         ask_calls: usize,
         prompts: Vec<String>,
+        events: Option<Rc<RefCell<Vec<&'static str>>>>,
     }
 
     struct FakeStatus {
@@ -658,6 +1021,86 @@ mod tests {
     struct FakeLogout {
         result: Result<(), LogoutError>,
         calls: usize,
+    }
+
+    #[derive(Default)]
+    struct FakeSessionState {
+        starts: usize,
+        shows: usize,
+        rollbacks: usize,
+        prompts: Vec<String>,
+        answers: Vec<String>,
+        failures: Vec<FailureCode>,
+    }
+
+    struct FakeSession {
+        state: Rc<RefCell<FakeSessionState>>,
+        start_error: Option<CreateError>,
+        append_error: Option<AppendError>,
+        rollback_error: Option<RollbackError>,
+        show_result: Result<ShowResult, ShowError>,
+        events: Option<Rc<RefCell<Vec<&'static str>>>>,
+    }
+
+    struct FakeSessionWriter {
+        state: Rc<RefCell<FakeSessionState>>,
+        append_error: Option<AppendError>,
+        rollback_error: Option<RollbackError>,
+        events: Option<Rc<RefCell<Vec<&'static str>>>>,
+    }
+
+    impl SessionAction for FakeSession {
+        fn start(&mut self, prompt: &str) -> Result<Box<dyn SessionWriteAction>, CreateError> {
+            if let Some(events) = &self.events {
+                events.borrow_mut().push("session-start");
+            }
+            self.state.borrow_mut().starts += 1;
+            if let Some(error) = self.start_error {
+                return Err(error);
+            }
+            self.state.borrow_mut().prompts.push(prompt.to_owned());
+            Ok(Box::new(FakeSessionWriter {
+                state: Rc::clone(&self.state),
+                append_error: self.append_error,
+                rollback_error: self.rollback_error,
+                events: self.events.as_ref().map(Rc::clone),
+            }))
+        }
+
+        fn show(&mut self, _session_id: &str) -> Result<ShowResult, ShowError> {
+            self.state.borrow_mut().shows += 1;
+            self.show_result.clone()
+        }
+    }
+
+    impl SessionWriteAction for FakeSessionWriter {
+        fn session_id(&self) -> &str {
+            SESSION_ID
+        }
+
+        fn append_assistant(self: Box<Self>, text: &str) -> Result<(), AppendError> {
+            if let Some(events) = &self.events {
+                events.borrow_mut().push("session-terminal");
+            }
+            self.state.borrow_mut().answers.push(text.to_owned());
+            self.append_error.map_or(Ok(()), Err)
+        }
+
+        fn append_failure(self: Box<Self>, failure_code: FailureCode) -> Result<(), AppendError> {
+            if let Some(events) = &self.events {
+                events.borrow_mut().push("session-terminal");
+            }
+            self.state.borrow_mut().failures.push(failure_code);
+            self.append_error.map_or(Ok(()), Err)
+        }
+
+        fn rollback(self: Box<Self>) -> Result<(), RollbackError> {
+            if let Some(events) = &self.events {
+                events.borrow_mut().push("session-rollback");
+            }
+            self.state.borrow_mut().rollbacks += 1;
+            self.rollback_error.map_or(Ok(()), Err)
+        }
     }
 
     impl LogoutAction for FakeLogout {
@@ -681,6 +1124,9 @@ mod tests {
         }
 
         fn ask_openai_codex(&mut self, prompt: &str) -> Result<String, ModelError> {
+            if let Some(events) = &self.events {
+                events.borrow_mut().push("model");
+            }
             self.ask_calls += 1;
             self.prompts.push(prompt.to_owned());
             self.ask_result.clone()
@@ -722,6 +1168,7 @@ mod tests {
             ask_result: Ok("One-shot answer.".to_owned()),
             ask_calls: 0,
             prompts: Vec::new(),
+            events: None,
         }
     }
 
@@ -736,6 +1183,17 @@ mod tests {
         FakeLogout {
             result: Ok(()),
             calls: 0,
+        }
+    }
+
+    fn fake_session_success() -> FakeSession {
+        FakeSession {
+            state: Rc::new(RefCell::new(FakeSessionState::default())),
+            start_error: None,
+            append_error: None,
+            rollback_error: None,
+            show_result: Err(ShowError::Missing),
+            events: None,
         }
     }
 
@@ -784,17 +1242,32 @@ mod tests {
         status: &mut FakeStatus,
         model: &mut FakeModel,
     ) -> (ExitCode, String, String) {
-        let arguments: Vec<_> = arguments.iter().map(OsString::from).collect();
-        let mut stdout = Vec::new();
-        let mut stderr = Vec::new();
-        let completion = run_application(
-            &arguments,
-            &mut stdout,
-            &mut stderr,
+        run_with_actions_and_session(
+            arguments,
             login,
             logout,
             status,
             model,
+            &mut fake_session_success(),
+        )
+    }
+
+    fn run_with_actions_and_session(
+        arguments: &[&str],
+        login: &mut FakeLogin,
+        logout: &mut FakeLogout,
+        status: &mut FakeStatus,
+        model: &mut FakeModel,
+        session: &mut FakeSession,
+    ) -> (ExitCode, String, String) {
+        let arguments: Vec<_> = arguments.iter().map(OsString::from).collect();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let completion = run_application_with_session(
+            &arguments,
+            &mut stdout,
+            &mut stderr,
+            test_actions(login, logout, status, model, session),
         );
         let status = complete(completion);
         (
@@ -802,6 +1275,70 @@ mod tests {
             String::from_utf8(stdout).unwrap(),
             String::from_utf8(stderr).unwrap(),
         )
+    }
+
+    fn run_application(
+        arguments: &[OsString],
+        stdout: &mut dyn Write,
+        stderr: &mut dyn Write,
+        login: &mut dyn LoginAction,
+        logout: &mut dyn LogoutAction,
+        status: &mut dyn StatusAction,
+        model: &mut dyn ModelAction,
+    ) -> Completion {
+        run_application_with_session(
+            arguments,
+            stdout,
+            stderr,
+            test_actions(login, logout, status, model, &mut fake_session_success()),
+        )
+    }
+
+    struct TestApplicationActions<'a> {
+        login: &'a mut dyn LoginAction,
+        logout: &'a mut dyn LogoutAction,
+        status: &'a mut dyn StatusAction,
+        model: &'a mut dyn ModelAction,
+        session: &'a mut dyn SessionAction,
+    }
+
+    fn test_actions<'a>(
+        login: &'a mut dyn LoginAction,
+        logout: &'a mut dyn LogoutAction,
+        status: &'a mut dyn StatusAction,
+        model: &'a mut dyn ModelAction,
+        session: &'a mut dyn SessionAction,
+    ) -> TestApplicationActions<'a> {
+        TestApplicationActions {
+            login,
+            logout,
+            status,
+            model,
+            session,
+        }
+    }
+
+    fn run_application_with_session(
+        arguments: &[OsString],
+        stdout: &mut dyn Write,
+        stderr: &mut dyn Write,
+        actions: TestApplicationActions<'_>,
+    ) -> Completion {
+        let TestApplicationActions {
+            login,
+            logout,
+            status,
+            model,
+            session,
+        } = actions;
+        let mut actions = ApplicationActions {
+            login,
+            logout,
+            status,
+            model,
+            session,
+        };
+        super::run_application(arguments, stdout, stderr, &mut actions)
     }
 
     struct BrokenWriter;
@@ -826,6 +1363,679 @@ mod tests {
         fn flush(&mut self) -> io::Result<()> {
             Err(io::Error::other("failed"))
         }
+    }
+
+    struct EventWriter {
+        events: Rc<RefCell<Vec<&'static str>>>,
+        event: &'static str,
+        recorded: bool,
+    }
+
+    impl Write for EventWriter {
+        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            if !self.recorded {
+                self.events.borrow_mut().push(self.event);
+                self.recorded = true;
+            }
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct TempRoot(std::path::PathBuf);
+
+    impl TempRoot {
+        fn new(label: &str) -> Self {
+            use std::sync::atomic::{AtomicU64, Ordering};
+
+            static NEXT: AtomicU64 = AtomicU64::new(0);
+            Self(env::temp_dir().join(format!(
+                "rust-agent-harness-cli-{label}-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            )))
+        }
+    }
+
+    impl Drop for TempRoot {
+        fn drop(&mut self) {
+            if self
+                .0
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("rust-agent-harness-cli-"))
+            {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+    }
+
+    #[test]
+    fn session_durability_boundaries_complete_before_model_and_output() {
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let mut model = fake_model_success();
+        model.events = Some(Rc::clone(&events));
+        let mut session = fake_session_success();
+        session.events = Some(Rc::clone(&events));
+        let arguments: Vec<_> = ["ask", "openai-codex", "prompt"]
+            .into_iter()
+            .map(OsString::from)
+            .collect();
+        let completion = run_application_with_session(
+            &arguments,
+            &mut EventWriter {
+                events: Rc::clone(&events),
+                event: "stdout",
+                recorded: false,
+            },
+            &mut EventWriter {
+                events: Rc::clone(&events),
+                event: "stderr",
+                recorded: false,
+            },
+            test_actions(
+                &mut fake_success(),
+                &mut fake_logout_success(),
+                &mut fake_status_success(),
+                &mut model,
+                &mut session,
+            ),
+        );
+
+        assert_eq!(complete(completion), ExitCode::SUCCESS);
+        assert_eq!(
+            *events.borrow(),
+            [
+                "session-start",
+                "model",
+                "session-terminal",
+                "stdout",
+                "stderr"
+            ]
+        );
+    }
+
+    #[test]
+    fn shell_invalid_prompts_never_create_and_defensive_invalid_prompt_rolls_back() {
+        for arguments in [
+            &["ask", "openai-codex"][..],
+            &["ask", "openai-codex", ""][..],
+            &["ask", "openai-codex", "   "][..],
+            &["ask", "openai-codex", "prompt", "extra"][..],
+        ] {
+            let mut session = fake_session_success();
+            let _ = run_with_actions_and_session(
+                arguments,
+                &mut fake_success(),
+                &mut fake_logout_success(),
+                &mut fake_status_success(),
+                &mut fake_model_success(),
+                &mut session,
+            );
+            assert_eq!(session.state.borrow().starts, 0, "{arguments:?}");
+        }
+
+        let mut model = fake_model_success();
+        model.ask_result = Err(ModelError::InvalidPrompt);
+        let mut session = fake_session_success();
+        let (status, stdout, stderr) = run_with_actions_and_session(
+            &["ask", "openai-codex", "valid"],
+            &mut fake_success(),
+            &mut fake_logout_success(),
+            &mut fake_status_success(),
+            &mut model,
+            &mut session,
+        );
+        assert_eq!(status, ExitCode::from(2));
+        assert!(stdout.is_empty());
+        assert!(!stderr.contains("Session:"));
+        let state = session.state.borrow();
+        assert_eq!(state.starts, 1);
+        assert_eq!(state.rollbacks, 1);
+        assert!(state.answers.is_empty());
+        assert!(state.failures.is_empty());
+        assert_eq!(model.ask_calls, 1);
+        assert_eq!(model.calls, 0);
+    }
+
+    #[test]
+    fn session_start_and_rollback_failures_stop_without_publishing_an_identifier() {
+        let mut session = fake_session_success();
+        session.start_error = Some(CreateError::StoreUnavailable);
+        let mut model = fake_model_success();
+        let (status, stdout, stderr) = run_with_actions_and_session(
+            &["ask", "openai-codex", "prompt"],
+            &mut fake_success(),
+            &mut fake_logout_success(),
+            &mut fake_status_success(),
+            &mut model,
+            &mut session,
+        );
+        assert_eq!(status, ExitCode::FAILURE);
+        assert!(stdout.is_empty());
+        assert_eq!(stderr, "error: unable to create the local session\n");
+        assert_eq!(model.ask_calls, 0);
+        assert_eq!(session.state.borrow().starts, 1);
+
+        let mut session = fake_session_success();
+        session.rollback_error = Some(RollbackError::StoreUnavailable);
+        let mut model = fake_model_success();
+        model.ask_result = Err(ModelError::InvalidPrompt);
+        let (status, stdout, stderr) = run_with_actions_and_session(
+            &["ask", "openai-codex", "prompt"],
+            &mut fake_success(),
+            &mut fake_logout_success(),
+            &mut fake_status_success(),
+            &mut model,
+            &mut session,
+        );
+        assert_eq!(status, ExitCode::FAILURE);
+        assert!(stdout.is_empty());
+        assert_eq!(
+            stderr,
+            "error: unable to roll back the invalid local session\n"
+        );
+        assert!(!stderr.contains("Session:"));
+        assert_eq!(session.state.borrow().rollbacks, 1);
+    }
+
+    #[test]
+    fn every_persistable_model_error_maps_to_one_closed_failure() {
+        for (error, failure) in [
+            (
+                ModelError::UnsupportedPlatform,
+                FailureCode::UnsupportedPlatform,
+            ),
+            (ModelError::NotConnected, FailureCode::NotConnected),
+            (
+                ModelError::CredentialStoreUnavailable,
+                FailureCode::CredentialStoreUnavailable,
+            ),
+            (
+                ModelError::InvalidCredential,
+                FailureCode::InvalidCredential,
+            ),
+            (
+                ModelError::ExpiredCredential,
+                FailureCode::ExpiredCredential,
+            ),
+            (
+                ModelError::CredentialRefreshBusy,
+                FailureCode::CredentialRefreshBusy,
+            ),
+            (
+                ModelError::CredentialRefreshUnavailable,
+                FailureCode::CredentialRefreshUnavailable,
+            ),
+            (ModelError::Unavailable, FailureCode::Unavailable),
+            (
+                ModelError::UnexpectedProviderResponse,
+                FailureCode::UnexpectedProviderResponse,
+            ),
+            (
+                ModelError::ConnectionRejected,
+                FailureCode::ConnectionRejected,
+            ),
+            (ModelError::AccessDenied, FailureCode::AccessDenied),
+            (ModelError::RateLimited, FailureCode::RateLimited),
+            (
+                ModelError::TemporarilyUnavailable,
+                FailureCode::TemporarilyUnavailable,
+            ),
+            (ModelError::Rejected, FailureCode::Rejected),
+            (
+                ModelError::InvalidProviderResponse,
+                FailureCode::InvalidProviderResponse,
+            ),
+            (ModelError::CallTimedOut, FailureCode::CallTimedOut),
+            (ModelError::ResponseTooLarge, FailureCode::ResponseTooLarge),
+            (ModelError::ModelCallFailed, FailureCode::ModelCallFailed),
+            (ModelError::EmptyResponse, FailureCode::EmptyResponse),
+        ] {
+            let mut model = fake_model_success();
+            model.ask_result = Err(error);
+            let mut session = fake_session_success();
+            let (status, stdout, stderr) = run_with_actions_and_session(
+                &["ask", "openai-codex", "prompt"],
+                &mut fake_success(),
+                &mut fake_logout_success(),
+                &mut fake_status_success(),
+                &mut model,
+                &mut session,
+            );
+            assert_eq!(status, ExitCode::FAILURE);
+            assert!(stdout.is_empty());
+            assert_eq!(stderr, format!("error: {error}\nSession: {SESSION_ID}\n"));
+            assert_eq!(session.state.borrow().failures, [failure]);
+            assert_eq!(model.ask_calls, 1);
+        }
+    }
+
+    #[test]
+    fn terminal_append_failure_preserves_model_result_without_retry() {
+        let mut session = fake_session_success();
+        session.append_error = Some(AppendError::StoreUnavailable);
+        let mut model = fake_model_success();
+        let (status, stdout, stderr) = run_with_actions_and_session(
+            &["ask", "openai-codex", "prompt"],
+            &mut fake_success(),
+            &mut fake_logout_success(),
+            &mut fake_status_success(),
+            &mut model,
+            &mut session,
+        );
+        assert_eq!(status, ExitCode::FAILURE);
+        assert_eq!(stdout, "One-shot answer.\n");
+        assert_eq!(
+            stderr,
+            format!("error: unable to persist the local session result\nSession: {SESSION_ID}\n")
+        );
+        assert_eq!(model.ask_calls, 1);
+        assert_eq!(session.state.borrow().answers, ["One-shot answer."]);
+
+        let mut session = fake_session_success();
+        session.append_error = Some(AppendError::StoreUnavailable);
+        let mut model = fake_model_success();
+        model.ask_result = Err(ModelError::RateLimited);
+        let (status, stdout, stderr) = run_with_actions_and_session(
+            &["ask", "openai-codex", "prompt"],
+            &mut fake_success(),
+            &mut fake_logout_success(),
+            &mut fake_status_success(),
+            &mut model,
+            &mut session,
+        );
+        assert_eq!(status, ExitCode::FAILURE);
+        assert!(stdout.is_empty());
+        assert_eq!(
+            stderr,
+            format!(
+                "error: OpenAI Codex usage or rate limit reached\nerror: unable to persist the local session result\nSession: {SESSION_ID}\n"
+            )
+        );
+        assert_eq!(model.ask_calls, 1);
+        assert_eq!(session.state.borrow().failures, [FailureCode::RateLimited]);
+    }
+
+    #[test]
+    fn ask_stream_failures_keep_status_and_side_effects_separate() {
+        let arguments: Vec<_> = ["ask", "openai-codex", "prompt"]
+            .into_iter()
+            .map(OsString::from)
+            .collect();
+
+        let mut model = fake_model_success();
+        let mut session = fake_session_success();
+        let completion = run_application_with_session(
+            &arguments,
+            &mut BrokenWriter,
+            &mut Vec::new(),
+            test_actions(
+                &mut fake_success(),
+                &mut fake_logout_success(),
+                &mut fake_status_success(),
+                &mut model,
+                &mut session,
+            ),
+        );
+        assert_eq!(complete(completion), ExitCode::SUCCESS);
+        assert_eq!(model.ask_calls, 1);
+        assert_eq!(session.state.borrow().answers.len(), 1);
+
+        let mut model = fake_model_success();
+        let mut session = fake_session_success();
+        let completion = run_application_with_session(
+            &arguments,
+            &mut Vec::new(),
+            &mut BrokenWriter,
+            test_actions(
+                &mut fake_success(),
+                &mut fake_logout_success(),
+                &mut fake_status_success(),
+                &mut model,
+                &mut session,
+            ),
+        );
+        assert_eq!(complete(completion), ExitCode::SUCCESS);
+        assert_eq!(model.ask_calls, 1);
+        assert_eq!(session.state.borrow().answers.len(), 1);
+
+        let mut model = fake_model_success();
+        let mut session = fake_session_success();
+        let completion = run_application_with_session(
+            &arguments,
+            &mut Vec::new(),
+            &mut FailedWriter,
+            test_actions(
+                &mut fake_success(),
+                &mut fake_logout_success(),
+                &mut fake_status_success(),
+                &mut model,
+                &mut session,
+            ),
+        );
+        assert_eq!(complete(completion), ExitCode::FAILURE);
+        assert_eq!(model.ask_calls, 1);
+        assert_eq!(session.state.borrow().answers.len(), 1);
+
+        let mut model = fake_model_success();
+        model.ask_result = Err(ModelError::Unavailable);
+        let mut session = fake_session_success();
+        let completion = run_application_with_session(
+            &arguments,
+            &mut Vec::new(),
+            &mut BrokenWriter,
+            test_actions(
+                &mut fake_success(),
+                &mut fake_logout_success(),
+                &mut fake_status_success(),
+                &mut model,
+                &mut session,
+            ),
+        );
+        assert_eq!(complete(completion), ExitCode::FAILURE);
+        assert_eq!(model.ask_calls, 1);
+        assert_eq!(session.state.borrow().failures.len(), 1);
+    }
+
+    #[test]
+    fn session_command_grammar_is_narrow_and_non_session_commands_are_ephemeral() {
+        for arguments in [
+            &["session", "show"][..],
+            &["session", "show", "ABCDEFABCDEFABCDEFABCDEFABCDEFAB"][..],
+            &["session", "show", "../../etc/passwd"][..],
+            &["session", "show", "--"][..],
+            &["session", "show", SESSION_ID, "extra"][..],
+            &["session", "--help", "extra"][..],
+            &["session", "show", "--help", "extra"][..],
+        ] {
+            let mut session = fake_session_success();
+            let (status, _, _) = run_with_actions_and_session(
+                arguments,
+                &mut fake_success(),
+                &mut fake_logout_success(),
+                &mut fake_status_success(),
+                &mut fake_model_success(),
+                &mut session,
+            );
+            assert_eq!(status, ExitCode::from(2), "{arguments:?}");
+            assert_eq!(session.state.borrow().shows, 0);
+        }
+
+        for arguments in [
+            &["session"][..],
+            &["session", "--help"][..],
+            &["session", "show", "--help"][..],
+        ] {
+            let mut session = fake_session_success();
+            let (status, stdout, stderr) = run_with_actions_and_session(
+                arguments,
+                &mut fake_success(),
+                &mut fake_logout_success(),
+                &mut fake_status_success(),
+                &mut fake_model_success(),
+                &mut session,
+            );
+            assert_eq!(status, ExitCode::SUCCESS);
+            assert!(!stdout.is_empty());
+            assert!(stderr.is_empty());
+            assert_eq!(session.state.borrow().shows, 0);
+        }
+
+        let mut session = fake_session_success();
+        let (status, stdout, stderr) = run_with_actions_and_session(
+            &["session", "show", SESSION_ID],
+            &mut fake_success(),
+            &mut fake_logout_success(),
+            &mut fake_status_success(),
+            &mut fake_model_success(),
+            &mut session,
+        );
+        assert_eq!(status, ExitCode::FAILURE);
+        assert!(stdout.is_empty());
+        assert_eq!(stderr, "error: the session was not found\n");
+        assert_eq!(session.state.borrow().shows, 1);
+
+        for arguments in [
+            &["--help"][..],
+            &["--version"][..],
+            &["auth", "status", "openai-codex"][..],
+            &["model", "test", "openai-codex"][..],
+        ] {
+            let mut session = fake_session_success();
+            let _ = run_with_actions_and_session(
+                arguments,
+                &mut fake_success(),
+                &mut fake_logout_success(),
+                &mut fake_status_success(),
+                &mut fake_model_success(),
+                &mut session,
+            );
+            let state = session.state.borrow();
+            assert_eq!(state.starts, 0, "{arguments:?}");
+            assert_eq!(state.shows, 0, "{arguments:?}");
+        }
+    }
+
+    #[test]
+    fn origin_aware_boundary_persists_only_semantic_content_and_show_sanitizes_it() {
+        struct SecretBoundaryModel {
+            forbidden: [&'static str; 9],
+            answer: String,
+            calls: usize,
+        }
+
+        impl ModelAction for SecretBoundaryModel {
+            fn test_openai_codex(&mut self) -> Result<String, ModelError> {
+                unreachable!()
+            }
+
+            fn ask_openai_codex(&mut self, _prompt: &str) -> Result<String, ModelError> {
+                self.calls += 1;
+                std::hint::black_box(self.forbidden);
+                Ok(self.answer.clone())
+            }
+        }
+
+        let forbidden = [
+            "credential-origin-sentinel",
+            "authorization-origin-sentinel",
+            "account-origin-sentinel",
+            "callback-origin-sentinel",
+            "state-origin-sentinel",
+            "verifier-origin-sentinel",
+            "correlation-origin-sentinel",
+            "environment-origin-sentinel",
+            "raw-provider-origin-sentinel",
+        ];
+        let prompt = "prompt-origin-sk-semantic\u{1b}[31m";
+        let answer = "answer-origin-token-semantic\u{202e}";
+        let root = TempRoot::new("origin-boundary");
+        let mut session =
+            ProductionSession::with_log(SessionLog::at_data_local_dir(root.0.clone()));
+        let mut model = SecretBoundaryModel {
+            forbidden,
+            answer: answer.to_owned(),
+            calls: 0,
+        };
+        let arguments: Vec<_> = ["ask", "openai-codex", prompt]
+            .into_iter()
+            .map(OsString::from)
+            .collect();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let completion = run_application_with_session(
+            &arguments,
+            &mut stdout,
+            &mut stderr,
+            test_actions(
+                &mut fake_success(),
+                &mut fake_logout_success(),
+                &mut fake_status_success(),
+                &mut model,
+                &mut session,
+            ),
+        );
+        assert_eq!(complete(completion), ExitCode::SUCCESS);
+        assert_eq!(model.calls, 1);
+        let stderr_text = String::from_utf8(stderr).unwrap();
+        let session_id = stderr_text
+            .strip_prefix("Session: ")
+            .and_then(|value| value.strip_suffix('\n'))
+            .unwrap();
+        assert!(valid_session_id(session_id));
+        let path = root.0.join("sessions").join(format!("{session_id}.jsonl"));
+        let canonical = std::fs::read(&path).unwrap();
+        let canonical_text = String::from_utf8(canonical).unwrap();
+        assert!(canonical_text.contains("prompt-origin-sk-semantic"));
+        assert!(canonical_text.contains("\\u001b"));
+        assert!(canonical_text.contains(answer));
+
+        let show_arguments: Vec<_> = ["session", "show", session_id]
+            .into_iter()
+            .map(OsString::from)
+            .collect();
+        let mut show_stdout = Vec::new();
+        let mut show_stderr = Vec::new();
+        let completion = run_application_with_session(
+            &show_arguments,
+            &mut show_stdout,
+            &mut show_stderr,
+            test_actions(
+                &mut fake_success(),
+                &mut fake_logout_success(),
+                &mut fake_status_success(),
+                &mut fake_model_success(),
+                &mut session,
+            ),
+        );
+        assert_eq!(complete(completion), ExitCode::SUCCESS);
+        assert!(show_stderr.is_empty());
+        let show_stdout = String::from_utf8(show_stdout).unwrap();
+        assert_eq!(
+            show_stdout,
+            format!(
+                "Session: {session_id}\nStatus: completed\nProvider: openai-codex\n\nUser:\nprompt-origin-sk-semantic\\u{{1b}}[31m\n\nAssistant:\nanswer-origin-token-semantic\\u{{202e}}\n"
+            )
+        );
+
+        let combined = format!(
+            "{canonical_text}{show_stdout}{stderr_text}{:?}{:?}",
+            ShowError::StoreUnavailable,
+            CreateError::StoreUnavailable
+        );
+        for sentinel in forbidden {
+            assert!(!combined.contains(sentinel));
+        }
+    }
+
+    #[test]
+    fn session_show_renders_interrupted_projection_exactly() {
+        let prompt = "interrupted prompt";
+        let root = TempRoot::new("show-interrupted");
+        let mut log = SessionLog::at_data_local_dir(root.0.clone());
+        let writer = log.start(prompt).unwrap();
+        let session_id = writer.session_id().to_owned();
+        drop(writer);
+        let arguments: Vec<_> = ["session", "show", session_id.as_str()]
+            .into_iter()
+            .map(OsString::from)
+            .collect();
+        let mut session = ProductionSession::with_log(log);
+        let mut model = fake_model_success();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let completion = run_application_with_session(
+            &arguments,
+            &mut stdout,
+            &mut stderr,
+            test_actions(
+                &mut fake_success(),
+                &mut fake_logout_success(),
+                &mut fake_status_success(),
+                &mut model,
+                &mut session,
+            ),
+        );
+        assert_eq!(complete(completion), ExitCode::SUCCESS);
+        assert!(stderr.is_empty());
+        assert_eq!(
+            String::from_utf8(stdout).unwrap(),
+            format!(
+                "Session: {session_id}\nStatus: interrupted\nProvider: openai-codex\n\nUser:\n{prompt}\n"
+            )
+        );
+        assert_eq!(model.calls, 0);
+        assert_eq!(model.ask_calls, 0);
+    }
+
+    #[test]
+    fn session_show_stream_rules_do_not_repeat_reads_or_touch_model_actions() {
+        let root = TempRoot::new("show-streams");
+        let mut log = SessionLog::at_data_local_dir(root.0.clone());
+        let writer = log.start("prompt").unwrap();
+        let session_id = writer.session_id().to_owned();
+        writer.append_assistant("answer").unwrap();
+        let path = root.0.join("sessions").join(format!("{session_id}.jsonl"));
+        use std::io::Write as _;
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(path)
+            .unwrap()
+            .write_all(b"torn")
+            .unwrap();
+        let arguments: Vec<_> = ["session", "show", session_id.as_str()]
+            .into_iter()
+            .map(OsString::from)
+            .collect();
+        let mut session = ProductionSession::with_log(log);
+        let mut model = fake_model_success();
+        let mut stderr = Vec::new();
+        let completion = run_application_with_session(
+            &arguments,
+            &mut BrokenWriter,
+            &mut stderr,
+            test_actions(
+                &mut fake_success(),
+                &mut fake_logout_success(),
+                &mut fake_status_success(),
+                &mut model,
+                &mut session,
+            ),
+        );
+        assert_eq!(complete(completion), ExitCode::SUCCESS);
+        assert_eq!(
+            String::from_utf8(stderr).unwrap(),
+            format!("warning: {TRAILING_FRAGMENT_WARNING}\n")
+        );
+        assert_eq!(model.calls, 0);
+        assert_eq!(model.ask_calls, 0);
+
+        let mut stderr = Vec::new();
+        let completion = run_application_with_session(
+            &arguments,
+            &mut FailedWriter,
+            &mut stderr,
+            test_actions(
+                &mut fake_success(),
+                &mut fake_logout_success(),
+                &mut fake_status_success(),
+                &mut model,
+                &mut session,
+            ),
+        );
+        assert_eq!(complete(completion), ExitCode::FAILURE);
+        assert_eq!(
+            String::from_utf8(stderr).unwrap(),
+            format!(
+                "warning: {TRAILING_FRAGMENT_WARNING}\nerror: unable to write session output\n"
+            )
+        );
+        assert_eq!(model.calls, 0);
+        assert_eq!(model.ask_calls, 0);
     }
 
     #[test]
@@ -1094,7 +2304,7 @@ mod tests {
         assert_eq!(model.prompts, [prompt]);
         assert_eq!(status, ExitCode::SUCCESS);
         assert_eq!(stdout, "One-shot answer.\n");
-        assert!(stderr.is_empty());
+        assert_eq!(stderr, format!("Session: {SESSION_ID}\n"));
 
         let mut login = fake_success();
         let mut model = fake_model_success();
@@ -1116,7 +2326,7 @@ mod tests {
             run_with_model(&["ask", "openai-codex", &boundary], &mut login, &mut model);
         assert_eq!(boundary.len(), MAX_PROMPT_BYTES);
         assert_eq!(status, ExitCode::SUCCESS);
-        assert!(stderr.is_empty());
+        assert_eq!(stderr, format!("Session: {SESSION_ID}\n"));
         assert_eq!(model.prompts, [boundary]);
 
         let mut login = fake_success();
@@ -1163,6 +2373,7 @@ mod tests {
                 ask_result: Ok("unused".to_owned()),
                 ask_calls: 0,
                 prompts: Vec::new(),
+                events: None,
             };
             let (status, stdout, stderr) =
                 run_with_model(&["model", "test", "openai-codex"], &mut login, &mut model);
@@ -1202,6 +2413,7 @@ mod tests {
                 ask_result: Err(error),
                 ask_calls: 0,
                 prompts: Vec::new(),
+                events: None,
             };
             let (status, stdout, stderr) = run_with_model(
                 &["model", "test", "openai-codex"],
@@ -1219,7 +2431,7 @@ mod tests {
             );
             assert_eq!(status, ExitCode::FAILURE);
             assert!(stdout.is_empty());
-            assert_eq!(stderr, format!("error: {message}\n"));
+            assert_eq!(stderr, format!("error: {message}\nSession: {SESSION_ID}\n"));
         }
     }
 
@@ -1257,7 +2469,10 @@ mod tests {
         );
         assert_eq!(complete(completion), ExitCode::FAILURE);
         let stderr = String::from_utf8(stderr).unwrap();
-        assert_eq!(stderr, "error: unable to write model output\n");
+        assert_eq!(
+            stderr,
+            format!("error: unable to write model output\nSession: {SESSION_ID}\n")
+        );
         assert!(!stderr.contains(prompt));
         assert!(!stderr.contains(answer));
     }
@@ -1566,7 +2781,12 @@ mod tests {
                 &mut fake_model_success(),
             );
             assert_eq!(complete(completion), ExitCode::FAILURE);
-            assert_eq!(stderr, b"error: unable to write model output\n");
+            let expected = if arguments.first() == Some(&OsString::from("ask")) {
+                format!("error: unable to write model output\nSession: {SESSION_ID}\n")
+            } else {
+                "error: unable to write model output\n".to_owned()
+            };
+            assert_eq!(stderr, expected.as_bytes());
 
             let completion = run_application(
                 &arguments,
@@ -1586,6 +2806,7 @@ mod tests {
             ask_result: Ok("unused".to_owned()),
             ask_calls: 0,
             prompts: Vec::new(),
+            events: None,
         };
         let arguments: Vec<_> = ["model", "test", "openai-codex"]
             .into_iter()
@@ -1721,6 +2942,6 @@ mod tests {
             &mut model,
         );
         assert_eq!(stdout, expected);
-        assert!(stderr.is_empty());
+        assert_eq!(stderr, format!("Session: {SESSION_ID}\n"));
     }
 }

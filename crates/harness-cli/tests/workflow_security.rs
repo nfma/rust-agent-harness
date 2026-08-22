@@ -98,6 +98,11 @@ fn dependabot_workflow() -> String {
     fs::read_to_string(path).expect("read Dependabot auto-merge workflow")
 }
 
+fn release_workflow() -> String {
+    let path = repository_root().join(".github/workflows/release.yml");
+    fs::read_to_string(path).expect("read release workflow")
+}
+
 fn workflow_step<'a>(workflow: &'a str, name: &str) -> &'a str {
     let marker = format!("      - name: {name}\n");
     let start = workflow
@@ -236,6 +241,36 @@ fn repository_security_workflows_keep_all_expected_gates() {
     assert!(dependency.contains("cargo audit --file Cargo.lock --deny warnings"));
     assert!(dependency.contains("actions/dependency-review-action@"));
     assert!(dependency.contains("fail-on-severity: low"));
+}
+
+#[test]
+fn linux_quality_gate_is_ungated_pinned_and_required_by_release_build() {
+    let workflow = release_workflow();
+    let (_, linux_and_after) = workflow
+        .split_once("  linux_quality:\n")
+        .expect("Linux quality job");
+    let (linux, _) = linux_and_after
+        .split_once("\n  stable_quality:\n")
+        .expect("bounded Linux quality job");
+    assert!(linux.contains("name: Linux quality gate"));
+    assert!(linux.contains("runs-on: ubuntu-24.04"));
+    assert!(linux.contains("rustup toolchain install \"$RUST_TOOLCHAIN\""));
+    assert!(linux.contains("run: cargo test --workspace --all-targets --locked"));
+    assert!(!linux.contains("\n    if:"));
+    for forbidden in ["github.actor", "secrets.", "environment:", "trusted"] {
+        assert!(
+            !linux.contains(forbidden),
+            "Linux quality job contains {forbidden}"
+        );
+    }
+
+    let (_, build_and_after) = workflow
+        .split_once("  build:\n")
+        .expect("release build job");
+    let (build, _) = build_and_after
+        .split_once("\n  assemble:\n")
+        .expect("bounded release build job");
+    assert!(build.contains("needs:\n      - release_gate\n      - quality\n      - linux_quality\n      - stable_quality"));
 }
 
 #[test]
