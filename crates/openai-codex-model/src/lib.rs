@@ -4,7 +4,7 @@ use std::fmt;
 use std::fmt::Write as _;
 use std::time::{Duration, Instant};
 
-use harness_openai_codex_auth::{AuthorizedCredential, CredentialReadError};
+use harness_openai_codex_auth::{AuthorizedCredential, CredentialUseError};
 use rand::{RngCore, rngs::OsRng};
 use reqwest::StatusCode;
 use reqwest::blocking::{Client, RequestBuilder};
@@ -32,6 +32,8 @@ pub enum ModelError {
     CredentialStoreUnavailable,
     InvalidCredential,
     ExpiredCredential,
+    CredentialRefreshBusy,
+    CredentialRefreshUnavailable,
     Unavailable,
     UnexpectedProviderResponse,
     ConnectionRejected,
@@ -67,6 +69,12 @@ impl fmt::Display for ModelError {
             Self::ExpiredCredential => {
                 "the OpenAI Codex connection expired; run 'harness auth login openai-codex'"
             }
+            Self::CredentialRefreshBusy => {
+                "OpenAI Codex credential refresh is already in progress; try again"
+            }
+            Self::CredentialRefreshUnavailable => {
+                "OpenAI Codex credential refresh is temporarily unavailable; try again"
+            }
             Self::Unavailable => "OpenAI Codex is unavailable; try again",
             Self::UnexpectedProviderResponse => "OpenAI Codex returned an unexpected response",
             Self::ConnectionRejected => {
@@ -88,33 +96,35 @@ impl fmt::Display for ModelError {
 impl std::error::Error for ModelError {}
 
 pub fn test_connection() -> Result<String, ModelError> {
-    match harness_openai_codex_auth::with_authorized_credential(|credential| {
-        let mut correlation_ids = RandomCorrelationIds;
-        test_connection_with(
-            credential,
-            &TransportConfig::production(),
-            &mut correlation_ids,
-        )
-    }) {
+    let mut correlation_ids = RandomCorrelationIds;
+    let config = TransportConfig::production();
+    match harness_openai_codex_auth::with_renewable_authorized_credential(
+        |credential| test_connection_with(credential, &config, &mut correlation_ids),
+        |error| *error == ModelError::ConnectionRejected,
+    ) {
         Ok(result) => result,
-        Err(error) => Err(map_credential_error(error)),
+        Err(error) => Err(map_credential_use_error(error)),
     }
 }
 
 pub fn ask(prompt: &str) -> Result<String, ModelError> {
     validate_prompt(prompt)?;
-    match harness_openai_codex_auth::with_authorized_credential(|credential| {
-        let mut correlation_ids = RandomCorrelationIds;
-        model_call_with(
-            credential,
-            &TransportConfig::production(),
-            &mut correlation_ids,
-            ASK_INSTRUCTIONS,
-            prompt,
-        )
-    }) {
+    let mut correlation_ids = RandomCorrelationIds;
+    let config = TransportConfig::production();
+    match harness_openai_codex_auth::with_renewable_authorized_credential(
+        |credential| {
+            model_call_with(
+                credential,
+                &config,
+                &mut correlation_ids,
+                ASK_INSTRUCTIONS,
+                prompt,
+            )
+        },
+        |error| *error == ModelError::ConnectionRejected,
+    ) {
         Ok(result) => result,
-        Err(error) => Err(map_credential_error(error)),
+        Err(error) => Err(map_credential_use_error(error)),
     }
 }
 
@@ -335,15 +345,19 @@ fn validate_content_type(
     }
 }
 
-fn map_credential_error(error: CredentialReadError) -> ModelError {
+fn map_credential_use_error(error: CredentialUseError) -> ModelError {
     match error {
-        CredentialReadError::UnsupportedPlatform => ModelError::UnsupportedPlatform,
-        CredentialReadError::NotConnected => ModelError::NotConnected,
-        CredentialReadError::StoreUnavailable => ModelError::CredentialStoreUnavailable,
-        CredentialReadError::UnsupportedVersion | CredentialReadError::InvalidCredential => {
+        CredentialUseError::UnsupportedPlatform => ModelError::UnsupportedPlatform,
+        CredentialUseError::NotConnected => ModelError::NotConnected,
+        CredentialUseError::StoreUnavailable => ModelError::CredentialStoreUnavailable,
+        CredentialUseError::UnsupportedVersion | CredentialUseError::InvalidCredential => {
             ModelError::InvalidCredential
         }
-        CredentialReadError::Expired => ModelError::ExpiredCredential,
+        CredentialUseError::RefreshCoordinationBusy => ModelError::CredentialRefreshBusy,
+        CredentialUseError::RefreshTemporarilyUnavailable => {
+            ModelError::CredentialRefreshUnavailable
+        }
+        CredentialUseError::ReauthenticationRequired => ModelError::ConnectionRejected,
     }
 }
 
@@ -652,7 +666,9 @@ mod tests {
         let ask_end = ask_tail.find("\ntrait RequestAuthorizer").unwrap();
         let ask_source = &ask_tail[..ask_end];
         let validation = ask_source.find("validate_prompt(prompt)?;").unwrap();
-        let credential = ask_source.find("with_authorized_credential").unwrap();
+        let credential = ask_source
+            .find("with_renewable_authorized_credential")
+            .unwrap();
         assert!(validation < credential);
 
         let oversized = "x".repeat(MAX_PROMPT_BYTES + 1);
@@ -732,6 +748,39 @@ mod tests {
 
         assert_eq!(requests[0].headers["session-id"], "correlation-one");
         assert_eq!(requests[1].headers["session-id"], "correlation-two");
+        for request in requests {
+            assert_eq!(
+                request.headers["session-id"],
+                request.headers["x-client-request-id"]
+            );
+        }
+    }
+
+    #[test]
+    fn renewable_replay_draws_a_new_correlation_id_per_attempt() {
+        let server = FakeServer::responses(vec![
+            (401, Some("application/json"), b"rejected".to_vec()),
+            (200, Some("text/event-stream"), completed("replayed")),
+        ]);
+        let transport = config(server.endpoint.clone());
+        let mut correlation_ids = ids(&["first-attempt", "replay-attempt"]);
+        let mut operation = |credential: &dyn RequestAuthorizer| {
+            test_connection_with(credential, &transport, &mut correlation_ids)
+        };
+
+        assert_eq!(
+            operation(&FakeAuthorizer),
+            Err(ModelError::ConnectionRejected)
+        );
+        assert_eq!(operation(&FakeAuthorizer).as_deref(), Ok("replayed"));
+        let requests = server.finish();
+
+        assert_eq!(requests[0].headers["session-id"], "first-attempt");
+        assert_eq!(requests[1].headers["session-id"], "replay-attempt");
+        assert_ne!(
+            requests[0].headers["session-id"],
+            requests[1].headers["session-id"]
+        );
         for request in requests {
             assert_eq!(
                 request.headers["session-id"],
@@ -1071,6 +1120,8 @@ mod tests {
             ModelError::CredentialStoreUnavailable,
             ModelError::InvalidCredential,
             ModelError::ExpiredCredential,
+            ModelError::CredentialRefreshBusy,
+            ModelError::CredentialRefreshUnavailable,
             ModelError::Unavailable,
             ModelError::UnexpectedProviderResponse,
             ModelError::ConnectionRejected,
@@ -1103,11 +1154,75 @@ mod tests {
     }
 
     #[test]
+    fn every_renewable_lifecycle_error_maps_to_the_pinned_model_error() {
+        let cases = [
+            (
+                CredentialUseError::UnsupportedPlatform,
+                ModelError::UnsupportedPlatform,
+            ),
+            (CredentialUseError::NotConnected, ModelError::NotConnected),
+            (
+                CredentialUseError::StoreUnavailable,
+                ModelError::CredentialStoreUnavailable,
+            ),
+            (
+                CredentialUseError::UnsupportedVersion,
+                ModelError::InvalidCredential,
+            ),
+            (
+                CredentialUseError::InvalidCredential,
+                ModelError::InvalidCredential,
+            ),
+            (
+                CredentialUseError::RefreshCoordinationBusy,
+                ModelError::CredentialRefreshBusy,
+            ),
+            (
+                CredentialUseError::RefreshTemporarilyUnavailable,
+                ModelError::CredentialRefreshUnavailable,
+            ),
+            (
+                CredentialUseError::ReauthenticationRequired,
+                ModelError::ConnectionRejected,
+            ),
+        ];
+
+        for (credential_error, expected) in cases {
+            assert_eq!(map_credential_use_error(credential_error), expected);
+        }
+    }
+
+    #[test]
+    fn both_public_model_entries_use_the_renewable_boundary_only() {
+        let source = include_str!("lib.rs");
+        let test_start = source.find("pub fn test_connection()").unwrap();
+        let ask_start = source.find("pub fn ask(prompt: &str)").unwrap();
+        let traits_start = source.find("trait RequestAuthorizer").unwrap();
+        let test_source = &source[test_start..ask_start];
+        let ask_source = &source[ask_start..traits_start];
+
+        for implementation in [test_source, ask_source] {
+            assert_eq!(
+                implementation
+                    .matches("with_renewable_authorized_credential")
+                    .count(),
+                1
+            );
+            assert!(!implementation.contains("with_authorized_credential("));
+            assert!(implementation.contains("ModelError::ConnectionRejected"));
+            assert!(implementation.contains("let mut correlation_ids = RandomCorrelationIds;"));
+            assert!(implementation.contains("&mut correlation_ids"));
+            assert!(!implementation.contains("correlation_ids.next()"));
+        }
+    }
+
+    #[test]
     fn random_correlation_ids_have_a_header_safe_fixed_width_shape() {
         let mut generator = RandomCorrelationIds;
         let first = generator.next();
 
         assert_eq!(first.len(), 32);
         assert!(first.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert_ne!(first, generator.next());
     }
 }

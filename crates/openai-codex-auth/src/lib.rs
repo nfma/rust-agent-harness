@@ -8,6 +8,10 @@ mod keychain;
 mod oauth;
 #[cfg(any(target_os = "macos", test))]
 mod pkce;
+#[cfg(any(target_os = "macos", test))]
+mod refresh;
+#[cfg(any(target_os = "macos", test))]
+mod refresh_lock;
 
 use std::fmt;
 #[cfg(any(target_os = "macos", test))]
@@ -25,6 +29,12 @@ use keychain::{CredentialDeleter, CredentialReader, CredentialStore, DeleteOutco
 use oauth::{ExchangeConfig, ExchangeError};
 #[cfg(any(target_os = "macos", test))]
 use pkce::AuthSecrets;
+#[cfg(target_os = "macos")]
+use refresh::HttpRefreshClient;
+#[cfg(any(target_os = "macos", test))]
+use refresh::{RefreshClient, RefreshError};
+#[cfg(any(target_os = "macos", test))]
+use refresh_lock::{LockError, RefreshLock};
 #[cfg(any(target_os = "macos", test))]
 use url::Url;
 
@@ -181,6 +191,44 @@ impl fmt::Display for CredentialReadError {
 impl std::error::Error for CredentialReadError {}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CredentialUseError {
+    UnsupportedPlatform,
+    NotConnected,
+    StoreUnavailable,
+    UnsupportedVersion,
+    InvalidCredential,
+    RefreshCoordinationBusy,
+    RefreshTemporarilyUnavailable,
+    ReauthenticationRequired,
+}
+
+impl fmt::Display for CredentialUseError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::UnsupportedPlatform => "OpenAI Codex credentials are supported only on macOS",
+            Self::NotConnected => {
+                "OpenAI Codex is not connected; run 'harness auth login openai-codex'"
+            }
+            Self::StoreUnavailable => "the OpenAI Codex credential store is unavailable",
+            Self::UnsupportedVersion | Self::InvalidCredential => {
+                "the stored OpenAI Codex connection is invalid; run 'harness auth login openai-codex'"
+            }
+            Self::RefreshCoordinationBusy => {
+                "OpenAI Codex credential refresh is already in progress; try again"
+            }
+            Self::RefreshTemporarilyUnavailable => {
+                "OpenAI Codex credential refresh is temporarily unavailable; try again"
+            }
+            Self::ReauthenticationRequired => {
+                "OpenAI Codex rejected the connection; run 'harness auth login openai-codex'"
+            }
+        })
+    }
+}
+
+impl std::error::Error for CredentialUseError {}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LogoutError {
     UnsupportedPlatform,
     StoreUnavailable,
@@ -262,6 +310,154 @@ fn with_authorized_credential_from<T>(
         account_id,
     };
     Ok(operation(&credential))
+}
+
+pub fn with_renewable_authorized_credential<T, E>(
+    operation: impl FnMut(&AuthorizedCredential) -> Result<T, E>,
+    is_unauthorized: impl Fn(&E) -> bool,
+) -> Result<Result<T, E>, CredentialUseError> {
+    #[cfg(target_os = "macos")]
+    {
+        let mut store = keychain::MacOsKeychain;
+        let refresh_lock =
+            refresh_lock::FileRefreshLock::production().map_err(map_refresh_lock_error)?;
+        with_renewable_authorized_credential_from(
+            &mut store,
+            &SystemClock,
+            &refresh_lock,
+            &HttpRefreshClient::production(),
+            operation,
+            is_unauthorized,
+        )
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = operation;
+        let _ = is_unauthorized;
+        Err(CredentialUseError::UnsupportedPlatform)
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn with_renewable_authorized_credential_from<T, E, S, L, R>(
+    store: &mut S,
+    clock: &dyn Clock,
+    refresh_lock: &L,
+    refresher: &R,
+    mut operation: impl FnMut(&AuthorizedCredential) -> Result<T, E>,
+    is_unauthorized: impl Fn(&E) -> bool,
+) -> Result<Result<T, E>, CredentialUseError>
+where
+    S: CredentialReader + CredentialStore,
+    L: RefreshLock,
+    R: RefreshClient,
+{
+    let (mut attempted_bytes, mut record) = read_renewable_record(store)?;
+    let mut contacted_refresh_endpoint = false;
+
+    if record.refresh_due(clock.unix_seconds()) {
+        let _guard = refresh_lock.acquire().map_err(map_refresh_lock_error)?;
+        let (reread_bytes, reread_record) = read_renewable_record(store)?;
+        if reread_bytes != attempted_bytes {
+            attempted_bytes = reread_bytes;
+            record = reread_record;
+        } else {
+            contacted_refresh_endpoint = true;
+            let response = refresher
+                .refresh(record.refresh_token())
+                .map_err(map_refresh_error)?;
+            let replacement = record
+                .apply_refresh(response, clock.unix_seconds())
+                .map_err(|_| CredentialUseError::InvalidCredential)?;
+            let replacement_bytes = replacement
+                .serialize()
+                .map_err(|_| CredentialUseError::InvalidCredential)?;
+            store
+                .replace(&replacement_bytes)
+                .map_err(|_| CredentialUseError::StoreUnavailable)?;
+            attempted_bytes = replacement_bytes;
+            record = replacement;
+        }
+    }
+
+    let first = operation(&authorized_credential(&record));
+    let Err(first_error) = first else {
+        return Ok(first);
+    };
+    if !is_unauthorized(&first_error) {
+        return Ok(Err(first_error));
+    }
+
+    let replay_record = {
+        let _guard = refresh_lock.acquire().map_err(map_refresh_lock_error)?;
+        let (reread_bytes, reread_record) = read_renewable_record(store)?;
+        if reread_bytes != attempted_bytes {
+            reread_record
+        } else if contacted_refresh_endpoint {
+            return Ok(Err(first_error));
+        } else {
+            let response = refresher
+                .refresh(record.refresh_token())
+                .map_err(map_refresh_error)?;
+            let replacement = record
+                .apply_refresh(response, clock.unix_seconds())
+                .map_err(|_| CredentialUseError::InvalidCredential)?;
+            let replacement_bytes = replacement
+                .serialize()
+                .map_err(|_| CredentialUseError::InvalidCredential)?;
+            store
+                .replace(&replacement_bytes)
+                .map_err(|_| CredentialUseError::StoreUnavailable)?;
+            replacement
+        }
+    };
+
+    Ok(operation(&authorized_credential(&replay_record)))
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn read_renewable_record(
+    reader: &dyn CredentialReader,
+) -> Result<(Vec<u8>, CredentialRecord), CredentialUseError> {
+    let serialized = reader
+        .read()
+        .map_err(|_| CredentialUseError::StoreUnavailable)?
+        .ok_or(CredentialUseError::NotConnected)?;
+    let record =
+        CredentialRecord::deserialize_structural(&serialized).map_err(|error| match error {
+            credential::StoredCredentialError::UnsupportedVersion => {
+                CredentialUseError::UnsupportedVersion
+            }
+            credential::StoredCredentialError::Malformed
+            | credential::StoredCredentialError::Expired => CredentialUseError::InvalidCredential,
+        })?;
+    Ok((serialized, record))
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn authorized_credential(record: &CredentialRecord) -> AuthorizedCredential {
+    let (access_token, account_id) = record.authorization();
+    AuthorizedCredential {
+        access_token,
+        account_id,
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn map_refresh_lock_error(error: LockError) -> CredentialUseError {
+    match error {
+        LockError::Busy => CredentialUseError::RefreshCoordinationBusy,
+        LockError::Unavailable => CredentialUseError::StoreUnavailable,
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn map_refresh_error(error: RefreshError) -> CredentialUseError {
+    match error {
+        RefreshError::ReauthenticationRequired => CredentialUseError::ReauthenticationRequired,
+        RefreshError::Unavailable => CredentialUseError::RefreshTemporarilyUnavailable,
+    }
 }
 
 pub fn login(progress: impl FnMut(LoginProgress)) -> Result<ConnectedAccount, LoginError> {
@@ -402,12 +598,14 @@ fn map_exchange_error(error: ExchangeError) -> LoginError {
 
 #[cfg(test)]
 mod tests {
-    use std::cell::Cell;
-    use std::collections::HashMap;
+    use std::cell::{Cell, RefCell};
+    use std::collections::{HashMap, VecDeque};
     use std::io::{Read, Write};
     use std::net::{Ipv4Addr, TcpListener, TcpStream};
-    use std::sync::{Arc, Mutex};
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+    use std::sync::{Arc, Barrier, Mutex};
     use std::thread;
+    use std::time::Instant;
 
     use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
     use serde_json::{Value, json};
@@ -423,6 +621,7 @@ mod tests {
     const ACCESS: &str = "fixed-access-token-sentinel";
     const REFRESH: &str = "fixed-refresh-token-sentinel";
     const ID_PAYLOAD_ACCOUNT: &str = "account-one";
+    static NEXT_REFRESH_TEMP_DIRECTORY: AtomicU64 = AtomicU64::new(0);
 
     struct FixedClock;
 
@@ -457,6 +656,187 @@ mod tests {
         reads: Cell<usize>,
     }
 
+    #[derive(Default)]
+    struct SharedStoreState {
+        record: Option<Vec<u8>>,
+        fail_read: bool,
+        fail_write: bool,
+        reads: usize,
+        writes: usize,
+    }
+
+    #[derive(Clone, Default)]
+    struct SharedStore(Arc<Mutex<SharedStoreState>>);
+
+    impl SharedStore {
+        fn with_record(record: Vec<u8>) -> Self {
+            Self(Arc::new(Mutex::new(SharedStoreState {
+                record: Some(record),
+                ..SharedStoreState::default()
+            })))
+        }
+
+        fn record(&self) -> Option<Vec<u8>> {
+            self.0.lock().unwrap().record.clone()
+        }
+
+        fn replace_without_counting(&self, record: Vec<u8>) {
+            self.0.lock().unwrap().record = Some(record);
+        }
+
+        fn reads(&self) -> usize {
+            self.0.lock().unwrap().reads
+        }
+
+        fn writes(&self) -> usize {
+            self.0.lock().unwrap().writes
+        }
+    }
+
+    impl CredentialReader for SharedStore {
+        fn read(&self) -> Result<Option<Vec<u8>>, keychain::StoreError> {
+            let mut state = self.0.lock().unwrap();
+            state.reads += 1;
+            if state.fail_read {
+                Err(keychain::StoreError)
+            } else {
+                Ok(state.record.clone())
+            }
+        }
+    }
+
+    impl CredentialStore for SharedStore {
+        fn replace(&mut self, record: &[u8]) -> Result<(), keychain::StoreError> {
+            let mut state = self.0.lock().unwrap();
+            state.writes += 1;
+            if state.fail_write {
+                Err(keychain::StoreError)
+            } else {
+                state.record = Some(record.to_vec());
+                Ok(())
+            }
+        }
+    }
+
+    struct FakeRefreshLock {
+        result: Result<(), LockError>,
+        acquisitions: Cell<usize>,
+    }
+
+    impl FakeRefreshLock {
+        fn available() -> Self {
+            Self {
+                result: Ok(()),
+                acquisitions: Cell::new(0),
+            }
+        }
+    }
+
+    impl RefreshLock for FakeRefreshLock {
+        type Guard = ();
+
+        fn acquire(&self) -> Result<Self::Guard, LockError> {
+            self.acquisitions.set(self.acquisitions.get() + 1);
+            self.result
+        }
+    }
+
+    struct MutatingRefreshLock {
+        replacement: Vec<u8>,
+        store: SharedStore,
+        acquisitions: Cell<usize>,
+    }
+
+    impl RefreshLock for MutatingRefreshLock {
+        type Guard = ();
+
+        fn acquire(&self) -> Result<Self::Guard, LockError> {
+            let acquisitions = self.acquisitions.get() + 1;
+            self.acquisitions.set(acquisitions);
+            if acquisitions == 1 {
+                self.store
+                    .replace_without_counting(self.replacement.clone());
+            }
+            Ok(())
+        }
+    }
+
+    struct FakeRefresher {
+        responses: RefCell<VecDeque<Result<refresh::RefreshResponse, RefreshError>>>,
+        calls: Cell<usize>,
+        refresh_tokens: RefCell<Vec<String>>,
+    }
+
+    impl FakeRefresher {
+        fn new(responses: Vec<Result<refresh::RefreshResponse, RefreshError>>) -> Self {
+            Self {
+                responses: RefCell::new(responses.into()),
+                calls: Cell::new(0),
+                refresh_tokens: RefCell::new(Vec::new()),
+            }
+        }
+    }
+
+    impl RefreshClient for FakeRefresher {
+        fn refresh(&self, refresh_token: &str) -> Result<refresh::RefreshResponse, RefreshError> {
+            self.calls.set(self.calls.get() + 1);
+            self.refresh_tokens
+                .borrow_mut()
+                .push(refresh_token.to_owned());
+            self.responses
+                .borrow_mut()
+                .pop_front()
+                .expect("a configured refresh response")
+        }
+    }
+
+    struct BarrierStore {
+        store: SharedStore,
+        first_read_barrier: Arc<Barrier>,
+        reads: AtomicUsize,
+    }
+
+    impl CredentialReader for BarrierStore {
+        fn read(&self) -> Result<Option<Vec<u8>>, keychain::StoreError> {
+            let result = self.store.read();
+            if self.reads.fetch_add(1, Ordering::SeqCst) == 0 {
+                self.first_read_barrier.wait();
+            }
+            result
+        }
+    }
+
+    impl CredentialStore for BarrierStore {
+        fn replace(&mut self, record: &[u8]) -> Result<(), keychain::StoreError> {
+            self.store.replace(record)
+        }
+    }
+
+    struct ConcurrentRefresher {
+        response: refresh::RefreshResponse,
+        calls: AtomicUsize,
+        refresh_tokens: Mutex<Vec<String>>,
+    }
+
+    impl RefreshClient for ConcurrentRefresher {
+        fn refresh(&self, refresh_token: &str) -> Result<refresh::RefreshResponse, RefreshError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.refresh_tokens
+                .lock()
+                .unwrap()
+                .push(refresh_token.to_owned());
+            Ok(self.response.clone())
+        }
+    }
+
+    struct MonotonicClock(Instant);
+
+    impl refresh_lock::WaitClock for MonotonicClock {
+        fn now(&self) -> Duration {
+            self.0.elapsed()
+        }
+    }
+
     struct FakeDeleter {
         result: Result<DeleteOutcome, StoreError>,
         calls: Cell<usize>,
@@ -486,11 +866,20 @@ mod tests {
         account_id: &str,
         expiry: Option<u64>,
     ) -> Vec<u8> {
+        let access_token = jwt_with_signature(
+            json!({
+                "https://api.openai.com/auth": {"chatgpt_account_id": account_id},
+                "exp": expiry
+            }),
+            access_token,
+        );
         serde_json::to_vec(&json!({
             "schema_version": schema_version,
             "access_token": access_token,
             "refresh_token": "stored-refresh-token-sentinel",
-            "id_token": "stored-id-token-sentinel",
+            "id_token": jwt_with_signature(json!({
+                "https://api.openai.com/auth": {"chatgpt_account_id": account_id}
+            }), "stored-id-token-sentinel"),
             "chatgpt_account_id": account_id,
             "access_token_expires_at": expiry,
             "email": null,
@@ -645,8 +1034,12 @@ mod tests {
     }
 
     fn jwt(payload: Value) -> String {
+        jwt_with_signature(payload, "signature")
+    }
+
+    fn jwt_with_signature(payload: Value, signature: &str) -> String {
         format!(
-            "{}.{}.signature",
+            "{}.{}.{signature}",
             URL_SAFE_NO_PAD.encode(br#"{"alg":"none"}"#),
             URL_SAFE_NO_PAD.encode(serde_json::to_vec(&payload).unwrap())
         )
@@ -671,6 +1064,43 @@ mod tests {
             "expires_in": 3600
         }))
         .unwrap()
+    }
+
+    fn refresh_response(
+        access_signature: &str,
+        account_id: Option<&str>,
+        access_expiry: Option<u64>,
+        refresh_token: Option<&str>,
+        id_token: Option<&str>,
+        expires_in: Option<i64>,
+    ) -> refresh::RefreshResponse {
+        let mut access_claims = json!({});
+        if let Some(account_id) = account_id {
+            access_claims["https://api.openai.com/auth"] =
+                json!({"chatgpt_account_id": account_id});
+        }
+        if let Some(expiry) = access_expiry {
+            access_claims["exp"] = json!(expiry);
+        }
+        refresh::RefreshResponse {
+            access_token: Some(jwt_with_signature(access_claims, access_signature)),
+            refresh_token: refresh_token.map(str::to_owned),
+            id_token: id_token.map(str::to_owned),
+            expires_in,
+        }
+    }
+
+    fn bearer_token(credential: &AuthorizedCredential) -> String {
+        let request = credential
+            .authorize(reqwest::blocking::Client::new().get("http://127.0.0.1/"))
+            .build()
+            .unwrap();
+        request.headers()[reqwest::header::AUTHORIZATION]
+            .to_str()
+            .unwrap()
+            .strip_prefix("Bearer ")
+            .unwrap()
+            .to_owned()
     }
 
     fn config(token_endpoint: Url) -> LoginConfig {
@@ -747,7 +1177,10 @@ mod tests {
     fn credential_read_applies_headers_through_an_opaque_redacted_capability() {
         let access = "stored-access-token-sentinel";
         let account = "stored-account-id-sentinel";
-        let reader = memory_reader(Some(stored_credential(1, access, account, Some(2_000))));
+        let serialized = stored_credential(1, access, account, Some(2_000));
+        let stored: Value = serde_json::from_slice(&serialized).unwrap();
+        let expected_access = stored["access_token"].as_str().unwrap().to_owned();
+        let reader = memory_reader(Some(serialized));
 
         let request = with_authorized_credential_from(&reader, &FixedClock, |credential| {
             assert_eq!(
@@ -763,7 +1196,7 @@ mod tests {
 
         assert_eq!(
             request.headers()[reqwest::header::AUTHORIZATION],
-            format!("Bearer {access}")
+            format!("Bearer {expected_access}")
         );
         assert_eq!(request.headers()["ChatGPT-Account-ID"], account);
         assert!(request.headers()["ChatGPT-Account-ID"].is_sensitive());
@@ -772,6 +1205,17 @@ mod tests {
 
     #[test]
     fn credential_read_failures_are_typed_and_never_invoke_the_operation() {
+        let empty_access_record = {
+            let mut record: Value = serde_json::from_slice(&stored_credential(
+                1,
+                "unused-access-signature",
+                "account-one",
+                Some(2_000),
+            ))
+            .unwrap();
+            record["access_token"] = json!("");
+            serde_json::to_vec(&record).unwrap()
+        };
         let cases = [
             (None, false, CredentialReadError::NotConnected),
             (None, true, CredentialReadError::StoreUnavailable),
@@ -791,7 +1235,7 @@ mod tests {
                 CredentialReadError::InvalidCredential,
             ),
             (
-                Some(stored_credential(1, "", "account-one", Some(2_000))),
+                Some(empty_access_record),
                 false,
                 CredentialReadError::InvalidCredential,
             ),
@@ -860,6 +1304,548 @@ mod tests {
 
         for sentinel in sentinels {
             assert!(!rendered.contains(sentinel));
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn public_renewable_operation_is_unsupported_without_keychain_access() {
+        let invoked = Cell::new(false);
+        let result = with_renewable_authorized_credential(
+            |_| {
+                invoked.set(true);
+                Ok::<_, ()>(())
+            },
+            |_| false,
+        );
+
+        assert_eq!(result, Err(CredentialUseError::UnsupportedPlatform));
+        assert!(!invoked.get());
+    }
+
+    #[test]
+    fn fresh_credential_uses_one_operation_without_lock_or_refresh() {
+        let original = stored_credential(1, "fresh-access", ID_PAYLOAD_ACCOUNT, Some(2_000));
+        let mut store = SharedStore::with_record(original.clone());
+        let refresh_lock = FakeRefreshLock::available();
+        let refresher = FakeRefresher::new(Vec::new());
+        let attempts = Cell::new(0);
+
+        let result = with_renewable_authorized_credential_from(
+            &mut store,
+            &FixedClock,
+            &refresh_lock,
+            &refresher,
+            |credential| {
+                attempts.set(attempts.get() + 1);
+                assert!(bearer_token(credential).ends_with(".fresh-access"));
+                Ok::<_, bool>("ok")
+            },
+            |error| *error,
+        );
+
+        assert_eq!(result, Ok(Ok("ok")));
+        assert_eq!(attempts.get(), 1);
+        assert_eq!(refresh_lock.acquisitions.get(), 0);
+        assert_eq!(refresher.calls.get(), 0);
+        assert_eq!(store.reads(), 1);
+        assert_eq!(store.writes(), 0);
+        assert_eq!(store.record().as_deref(), Some(original.as_slice()));
+    }
+
+    #[test]
+    fn near_expired_and_unknown_credentials_refresh_once_before_use() {
+        for expiry in [Some(1_300), Some(999), None] {
+            let original = stored_credential(1, "old-access", ID_PAYLOAD_ACCOUNT, expiry);
+            let mut store = SharedStore::with_record(original.clone());
+            let refresh_lock = FakeRefreshLock::available();
+            let refresher = FakeRefresher::new(vec![Ok(refresh_response(
+                "new-access",
+                None,
+                Some(5_000),
+                Some("rotated-refresh"),
+                None,
+                Some(3_600),
+            ))]);
+            let store_observer = store.clone();
+
+            let result = with_renewable_authorized_credential_from(
+                &mut store,
+                &FixedClock,
+                &refresh_lock,
+                &refresher,
+                |credential| {
+                    assert_eq!(
+                        store_observer.writes(),
+                        1,
+                        "replacement must precede operation"
+                    );
+                    assert!(bearer_token(credential).ends_with(".new-access"));
+                    Ok::<_, bool>(())
+                },
+                |error| *error,
+            );
+
+            assert_eq!(result, Ok(Ok(())));
+            assert_eq!(refresher.calls.get(), 1);
+            assert_eq!(refresher.refresh_tokens.borrow().len(), 1);
+            assert_eq!(refresh_lock.acquisitions.get(), 1);
+            assert_eq!(store.reads(), 2);
+            assert_eq!(store.writes(), 1);
+            assert_ne!(store.record().as_deref(), Some(original.as_slice()));
+            let stored: Value = serde_json::from_slice(&store.record().unwrap()).unwrap();
+            assert_eq!(stored["refresh_token"], "rotated-refresh");
+        }
+    }
+
+    #[test]
+    fn determinate_short_refresh_is_persisted_and_used() {
+        let original = stored_credential(1, "old-short-access", ID_PAYLOAD_ACCOUNT, Some(1_300));
+        let mut store = SharedStore::with_record(original);
+        let refresh_lock = FakeRefreshLock::available();
+        let refresher = FakeRefresher::new(vec![Ok(refresh_response(
+            "short-access",
+            None,
+            Some(1_000),
+            Some("rotated-short-refresh"),
+            None,
+            Some(300),
+        ))]);
+
+        let result = with_renewable_authorized_credential_from(
+            &mut store,
+            &FixedClock,
+            &refresh_lock,
+            &refresher,
+            |credential| Ok::<_, bool>(bearer_token(credential)),
+            |error| *error,
+        );
+
+        assert!(matches!(result, Ok(Ok(token)) if token.ends_with(".short-access")));
+        let stored: Value = serde_json::from_slice(&store.record().unwrap()).unwrap();
+        assert_eq!(stored["refresh_token"], "rotated-short-refresh");
+        assert_eq!(stored["access_token_expires_at"], 1_000);
+        assert_eq!(store.writes(), 1);
+    }
+
+    #[test]
+    fn failed_persistence_never_exposes_the_unpersisted_access_token() {
+        let original = stored_credential(1, "old-access", ID_PAYLOAD_ACCOUNT, Some(1_300));
+        let mut store = SharedStore::with_record(original.clone());
+        store.0.lock().unwrap().fail_write = true;
+        let refresh_lock = FakeRefreshLock::available();
+        let refresher = FakeRefresher::new(vec![Ok(refresh_response(
+            "must-not-be-used",
+            None,
+            Some(5_000),
+            Some("must-not-be-persisted"),
+            None,
+            Some(3_600),
+        ))]);
+        let invoked = Cell::new(false);
+
+        let result = with_renewable_authorized_credential_from(
+            &mut store,
+            &FixedClock,
+            &refresh_lock,
+            &refresher,
+            |_| {
+                invoked.set(true);
+                Ok::<_, bool>(())
+            },
+            |error| *error,
+        );
+
+        assert_eq!(result, Err(CredentialUseError::StoreUnavailable));
+        assert!(!invoked.get());
+        assert_eq!(store.record().as_deref(), Some(original.as_slice()));
+        assert_eq!(store.writes(), 1);
+    }
+
+    #[test]
+    fn first_unauthorized_refreshes_and_replays_once_but_second_unauthorized_stops() {
+        for second_succeeds in [true, false] {
+            let mut store = SharedStore::with_record(stored_credential(
+                1,
+                "old-access",
+                ID_PAYLOAD_ACCOUNT,
+                Some(5_000),
+            ));
+            let refresh_lock = FakeRefreshLock::available();
+            let refresher = FakeRefresher::new(vec![Ok(refresh_response(
+                "reactive-access",
+                None,
+                Some(5_000),
+                Some("reactive-refresh"),
+                None,
+                Some(3_600),
+            ))]);
+            let attempts = Cell::new(0);
+            let seen = RefCell::new(Vec::new());
+
+            let result = with_renewable_authorized_credential_from(
+                &mut store,
+                &FixedClock,
+                &refresh_lock,
+                &refresher,
+                |credential| {
+                    attempts.set(attempts.get() + 1);
+                    seen.borrow_mut().push(bearer_token(credential));
+                    if attempts.get() == 1 || !second_succeeds {
+                        Err(true)
+                    } else {
+                        Ok("replayed")
+                    }
+                },
+                |error| *error,
+            );
+
+            if second_succeeds {
+                assert_eq!(result, Ok(Ok("replayed")));
+            } else {
+                assert_eq!(result, Ok(Err(true)));
+            }
+            assert_eq!(attempts.get(), 2);
+            assert!(seen.borrow()[0].ends_with(".old-access"));
+            assert!(seen.borrow()[1].ends_with(".reactive-access"));
+            assert_eq!(refresher.calls.get(), 1);
+            assert_eq!(store.writes(), 1);
+            assert_eq!(refresh_lock.acquisitions.get(), 1);
+        }
+    }
+
+    #[test]
+    fn non_unauthorized_model_error_is_never_refreshed_or_replayed() {
+        let mut store = SharedStore::with_record(stored_credential(
+            1,
+            "fresh-access",
+            ID_PAYLOAD_ACCOUNT,
+            Some(5_000),
+        ));
+        let refresh_lock = FakeRefreshLock::available();
+        let refresher = FakeRefresher::new(Vec::new());
+        let attempts = Cell::new(0);
+
+        let result = with_renewable_authorized_credential_from(
+            &mut store,
+            &FixedClock,
+            &refresh_lock,
+            &refresher,
+            |_| {
+                attempts.set(attempts.get() + 1);
+                Err::<(), _>(false)
+            },
+            |error| *error,
+        );
+
+        assert_eq!(result, Ok(Err(false)));
+        assert_eq!(attempts.get(), 1);
+        assert_eq!(refresher.calls.get(), 0);
+        assert_eq!(refresh_lock.acquisitions.get(), 0);
+    }
+
+    #[test]
+    fn proactive_refresh_then_unauthorized_does_not_refresh_or_replay_unchanged_bytes() {
+        let mut store = SharedStore::with_record(stored_credential(
+            1,
+            "near-access",
+            ID_PAYLOAD_ACCOUNT,
+            Some(1_300),
+        ));
+        let refresh_lock = FakeRefreshLock::available();
+        let refresher = FakeRefresher::new(vec![Ok(refresh_response(
+            "proactive-access",
+            None,
+            Some(5_000),
+            Some("proactive-refresh"),
+            None,
+            Some(3_600),
+        ))]);
+        let attempts = Cell::new(0);
+
+        let result = with_renewable_authorized_credential_from(
+            &mut store,
+            &FixedClock,
+            &refresh_lock,
+            &refresher,
+            |_| {
+                attempts.set(attempts.get() + 1);
+                Err::<(), _>(true)
+            },
+            |error| *error,
+        );
+
+        assert_eq!(result, Ok(Err(true)));
+        assert_eq!(attempts.get(), 1);
+        assert_eq!(refresher.calls.get(), 1);
+        assert_eq!(store.writes(), 1);
+        assert_eq!(refresh_lock.acquisitions.get(), 2);
+    }
+
+    #[test]
+    fn proactive_refresh_then_unauthorized_replays_only_byte_different_winner() {
+        let mut store = SharedStore::with_record(stored_credential(
+            1,
+            "near-access",
+            ID_PAYLOAD_ACCOUNT,
+            Some(1_300),
+        ));
+        let store_handle = store.clone();
+        let winner = stored_credential(1, "winner-access", ID_PAYLOAD_ACCOUNT, Some(5_000));
+        let refresh_lock = FakeRefreshLock::available();
+        let refresher = FakeRefresher::new(vec![Ok(refresh_response(
+            "proactive-access",
+            None,
+            Some(5_000),
+            Some("proactive-refresh"),
+            None,
+            Some(3_600),
+        ))]);
+        let attempts = Cell::new(0);
+
+        let result = with_renewable_authorized_credential_from(
+            &mut store,
+            &FixedClock,
+            &refresh_lock,
+            &refresher,
+            |credential| {
+                attempts.set(attempts.get() + 1);
+                if attempts.get() == 1 {
+                    assert!(bearer_token(credential).ends_with(".proactive-access"));
+                    store_handle.replace_without_counting(winner.clone());
+                    Err(true)
+                } else {
+                    assert!(bearer_token(credential).ends_with(".winner-access"));
+                    Ok("adopted")
+                }
+            },
+            |error| *error,
+        );
+
+        assert_eq!(result, Ok(Ok("adopted")));
+        assert_eq!(attempts.get(), 2);
+        assert_eq!(refresher.calls.get(), 1);
+        assert_eq!(store.writes(), 1);
+        assert_eq!(refresh_lock.acquisitions.get(), 2);
+    }
+
+    #[test]
+    fn lock_reread_adopts_a_structurally_valid_winner_without_refreshing() {
+        let mut store = SharedStore::with_record(stored_credential(
+            1,
+            "loser-access",
+            ID_PAYLOAD_ACCOUNT,
+            Some(1_300),
+        ));
+        let winner = stored_credential(1, "winner-access", ID_PAYLOAD_ACCOUNT, Some(5_000));
+        let refresh_lock = MutatingRefreshLock {
+            replacement: winner.clone(),
+            store: store.clone(),
+            acquisitions: Cell::new(0),
+        };
+        let refresher = FakeRefresher::new(Vec::new());
+
+        let result = with_renewable_authorized_credential_from(
+            &mut store,
+            &FixedClock,
+            &refresh_lock,
+            &refresher,
+            |credential| Ok::<_, bool>(bearer_token(credential)),
+            |error| *error,
+        );
+
+        assert!(matches!(result, Ok(Ok(token)) if token.ends_with(".winner-access")));
+        assert_eq!(refresher.calls.get(), 0);
+        assert_eq!(store.writes(), 0);
+        assert_eq!(store.record().as_deref(), Some(winner.as_slice()));
+        assert_eq!(store.reads(), 2);
+    }
+
+    #[test]
+    fn lock_failures_and_invalid_rereads_stop_before_refresh_or_model_use() {
+        let original = stored_credential(1, "near-access", ID_PAYLOAD_ACCOUNT, Some(1_300));
+        for (lock_error, expected) in [
+            (LockError::Busy, CredentialUseError::RefreshCoordinationBusy),
+            (LockError::Unavailable, CredentialUseError::StoreUnavailable),
+        ] {
+            let mut store = SharedStore::with_record(original.clone());
+            let refresh_lock = FakeRefreshLock {
+                result: Err(lock_error),
+                acquisitions: Cell::new(0),
+            };
+            let refresher = FakeRefresher::new(Vec::new());
+            let invoked = Cell::new(false);
+            let result = with_renewable_authorized_credential_from(
+                &mut store,
+                &FixedClock,
+                &refresh_lock,
+                &refresher,
+                |_| {
+                    invoked.set(true);
+                    Ok::<_, bool>(())
+                },
+                |error| *error,
+            );
+
+            assert_eq!(result, Err(expected));
+            assert!(!invoked.get());
+            assert_eq!(refresher.calls.get(), 0);
+            assert_eq!(store.record().as_deref(), Some(original.as_slice()));
+        }
+
+        let mut store = SharedStore::with_record(original);
+        let refresh_lock = MutatingRefreshLock {
+            replacement: b"malformed-winner-bytes".to_vec(),
+            store: store.clone(),
+            acquisitions: Cell::new(0),
+        };
+        let refresher = FakeRefresher::new(Vec::new());
+        let result = with_renewable_authorized_credential_from(
+            &mut store,
+            &FixedClock,
+            &refresh_lock,
+            &refresher,
+            |_| Ok::<_, bool>(()),
+            |error| *error,
+        );
+        assert_eq!(result, Err(CredentialUseError::InvalidCredential));
+        assert_eq!(refresher.calls.get(), 0);
+        assert_eq!(store.writes(), 0);
+    }
+
+    #[test]
+    fn concurrent_callers_use_independent_file_handles_and_spend_the_old_token_once() {
+        let _serial = refresh_lock::FILE_LOCK_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let sequence = NEXT_REFRESH_TEMP_DIRECTORY.fetch_add(1, Ordering::Relaxed);
+        let temporary = std::env::temp_dir().join(format!(
+            "rust-agent-harness-refresh-concurrency-{}-{sequence}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&temporary).unwrap();
+        let private_root = temporary.join("rust-agent-harness");
+        let shared_store = SharedStore::with_record(stored_credential(
+            1,
+            "concurrent-old-access",
+            ID_PAYLOAD_ACCOUNT,
+            Some(1_300),
+        ));
+        let first_read_barrier = Arc::new(Barrier::new(2));
+        let refresher = Arc::new(ConcurrentRefresher {
+            response: refresh_response(
+                "concurrent-winner-access",
+                None,
+                Some(5_000),
+                Some("concurrent-rotated-refresh"),
+                None,
+                Some(3_600),
+            ),
+            calls: AtomicUsize::new(0),
+            refresh_tokens: Mutex::new(Vec::new()),
+        });
+
+        let mut workers = Vec::new();
+        for _ in 0..2 {
+            let mut store = BarrierStore {
+                store: shared_store.clone(),
+                first_read_barrier: Arc::clone(&first_read_barrier),
+                reads: AtomicUsize::new(0),
+            };
+            let refresher = Arc::clone(&refresher);
+            let private_root = private_root.clone();
+            workers.push(thread::spawn(move || {
+                let refresh_lock = refresh_lock::FileRefreshLock::with_root(
+                    private_root,
+                    MonotonicClock(Instant::now()),
+                    refresh_lock::ThreadSleeper,
+                );
+                with_renewable_authorized_credential_from(
+                    &mut store,
+                    &FixedClock,
+                    &refresh_lock,
+                    refresher.as_ref(),
+                    |credential| Ok::<_, bool>(bearer_token(credential)),
+                    |error| *error,
+                )
+            }));
+        }
+
+        let results: Vec<_> = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect();
+
+        for result in results {
+            assert!(
+                matches!(result, Ok(Ok(token)) if token.ends_with(".concurrent-winner-access"))
+            );
+        }
+        assert_eq!(refresher.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            refresher.refresh_tokens.lock().unwrap().as_slice(),
+            ["stored-refresh-token-sentinel"]
+        );
+        assert_eq!(shared_store.writes(), 1);
+        let stored: Value = serde_json::from_slice(&shared_store.record().unwrap()).unwrap();
+        assert_eq!(stored["refresh_token"], "concurrent-rotated-refresh");
+        std::fs::remove_dir_all(&temporary).unwrap();
+    }
+
+    #[test]
+    fn refresh_and_coordination_failures_are_fieldless_redacted_and_preserve_bytes() {
+        let original = stored_credential(1, "old-access", ID_PAYLOAD_ACCOUNT, Some(1_300));
+        for (refresh_result, expected) in [
+            (
+                Err(RefreshError::Unavailable),
+                CredentialUseError::RefreshTemporarilyUnavailable,
+            ),
+            (
+                Err(RefreshError::ReauthenticationRequired),
+                CredentialUseError::ReauthenticationRequired,
+            ),
+            (
+                Ok(refresh::RefreshResponse {
+                    access_token: Some(jwt(json!({}))),
+                    refresh_token: None,
+                    id_token: None,
+                    expires_in: None,
+                }),
+                CredentialUseError::InvalidCredential,
+            ),
+        ] {
+            let mut store = SharedStore::with_record(original.clone());
+            let refresh_lock = FakeRefreshLock::available();
+            let refresher = FakeRefresher::new(vec![refresh_result]);
+            let result = with_renewable_authorized_credential_from(
+                &mut store,
+                &FixedClock,
+                &refresh_lock,
+                &refresher,
+                |_| Ok::<_, bool>(()),
+                |error| *error,
+            );
+
+            assert_eq!(result, Err(expected));
+            assert_eq!(store.record().as_deref(), Some(original.as_slice()));
+            assert_eq!(store.writes(), 0);
+        }
+
+        let all_errors = [
+            CredentialUseError::UnsupportedPlatform,
+            CredentialUseError::NotConnected,
+            CredentialUseError::StoreUnavailable,
+            CredentialUseError::UnsupportedVersion,
+            CredentialUseError::InvalidCredential,
+            CredentialUseError::RefreshCoordinationBusy,
+            CredentialUseError::RefreshTemporarilyUnavailable,
+            CredentialUseError::ReauthenticationRequired,
+        ];
+        for error in all_errors {
+            let rendered = format!("{error:?} {error}");
+            for sentinel in [ACCESS, REFRESH, "old-access", "stored-id-token-sentinel"] {
+                assert!(!rendered.contains(sentinel));
+            }
         }
     }
 

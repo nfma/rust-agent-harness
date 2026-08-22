@@ -566,3 +566,24 @@ fn production_logout_calls_only_the_concrete_auth_operation() {
         );
     }
 }
+
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn production_model_commands_keep_lifecycle_failures_on_stderr() {
+    for arguments in [
+        vec!["model", "test", "openai-codex"],
+        vec!["ask", "openai-codex", "safe prompt"],
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_harness"))
+            .args(arguments)
+            .output()
+            .expect("harness should run");
+
+        assert_eq!(output.status.code(), Some(1));
+        assert!(output.stdout.is_empty());
+        assert_eq!(
+            String::from_utf8(output.stderr).unwrap(),
+            "error: OpenAI Codex model calls are supported only on macOS\n"
+        );
+    }
+}
