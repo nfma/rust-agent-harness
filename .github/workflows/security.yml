@@ -45,15 +45,31 @@ jobs:
           ./scripts/install-linux-ci-tools.sh "$RUNNER_TEMP/ci-tools"
           echo "$RUNNER_TEMP/ci-tools" >> "$GITHUB_PATH"
 
+      - name: Test Semgrep rule-pack helper
+        run: python3 -m unittest tests/test_semgrep_packs.py
+
       - name: Run Semgrep community security rules
-        run: >-
-          uvx --no-build --from semgrep==1.173.0 semgrep scan
-          --config p/default
-          --config p/security-audit
-          --error
-          --metrics=off
-          --exclude target
-          .
+        run: |
+          rules=".semgrep/rules"
+          mkdir -p "$rules"
+          curl --fail --silent --show-error --proto '=https' --tlsv1.2 \
+            --max-time 60 --max-filesize 8388608 \
+            --output "$rules/default.yml" \
+            https://semgrep.dev/c/p/default
+          curl --fail --silent --show-error --proto '=https' --tlsv1.2 \
+            --max-time 60 --max-filesize 8388608 \
+            --output "$rules/security-audit.yml" \
+            https://semgrep.dev/c/p/security-audit
+          python3 scripts/semgrep_packs.py verify \
+            --manifest .semgrep/packs.lock.json \
+            --input-dir "$rules"
+          uvx --no-build --from semgrep==1.173.0 semgrep scan \
+            --config "$rules/default.yml" \
+            --config "$rules/security-audit.yml" \
+            --error \
+            --metrics=off \
+            --exclude target \
+            .
 
       - name: Scan Git history for secrets
         run: gitleaks git --redact --verbose .

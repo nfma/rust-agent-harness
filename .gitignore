@@ -2,3 +2,5 @@
 /lcov.info
 .DS_Store
 .serena/
+__pycache__/
+/.semgrep/rules/
