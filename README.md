@@ -55,11 +55,21 @@ Inspect a known session without contacting OpenAI or reading the Keychain:
 cargo run --quiet --locked -p harness-cli -- session show <session-id>
 ```
 
-Session files remain until you manually remove them. There is no opt-out, list, delete, retention, or automatic-cleanup command in this increment, and the stderr `Session:` line is the only CLI handle. If that line is discarded or lost, the session remains on disk but cannot be reached through the CLI. Files live under:
+Rediscover retained session identifiers without displaying their content:
+
+```sh
+cargo run --quiet --locked -p harness-cli -- session list
+```
+
+The list is metadata-only: it reveals each local session identifier, canonical creation time in Unix milliseconds, status, and the retained-session count to the invoking user. Strictly projected sessions are newest first; busy or unhealthy entries have no trusted creation time and follow in identifier order. One invocation inspects at most 4,096 directory entries, 4,096 canonical session files, and 64 MiB (67,108,864 bytes) of aggregate locked file sizes. Exceeding any whole-inventory bound returns no partial list and directs you to the documented directory for manual removal.
+
+Session files remain until you manually remove them. Use `session list` if the stderr `Session:` line was discarded or lost. There is no opt-out, delete, retention, or automatic-cleanup command in this increment. Files live under:
 
 - macOS: `~/Library/Application Support/rust-agent-harness/sessions/`
 - Linux with `XDG_DATA_HOME`: `$XDG_DATA_HOME/rust-agent-harness/sessions/`
 - Linux otherwise: `~/.local/share/rust-agent-harness/sessions/`
+
+Listing remains a bounded scan rather than a catalog: it can become slower near the limits, and the 4,097th directory entry or canonical session makes discovery fail until files are removed manually. Pagination, search, deletion, archival, retention policy, and automatic cleanup remain deferred.
 
 Both model commands transparently refresh a harness-owned credential when its expiry is unknown, elapsed, or within five minutes. A successful rotation is validated and saved to Keychain before the model request uses it. The first model HTTP `401` may cause one serialized refresh or adoption of another harness process's replacement and one replay; other model failures are not replayed. If refresh is permanently rejected, reconnect with the browser command:
 

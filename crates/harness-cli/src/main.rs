@@ -8,8 +8,9 @@ use harness_openai_codex_auth::{
 };
 use harness_openai_codex_model::ModelError;
 use harness_session_log::{
-    AppendError, CreateError, FailureCode, ProjectedTerminal, RollbackError, SessionLog,
-    SessionStatus, SessionWriter, ShowError, ShowResult, TRAILING_FRAGMENT_WARNING,
+    AppendError, CreateError, FailureCode, ListError, ListResult, ListedSessionStatus,
+    ProjectedTerminal, RollbackError, SessionLog, SessionStatus, SessionWriter, ShowError,
+    ShowResult, TRAILING_FRAGMENT_WARNING,
 };
 
 const HELP: &str = "A local coding-agent harness
@@ -17,15 +18,16 @@ const HELP: &str = "A local coding-agent harness
 Usage: harness [OPTIONS] [COMMAND]
 
 Commands:
-  ask    Ask OpenAI Codex one question
-  auth   Manage account authentication
-  model  Exercise model connections
-  session  Inspect a retained session
+  ask      Ask OpenAI Codex one question
+  auth     Manage account authentication
+  model    Exercise model connections
+  session  Inspect retained sessions
 
 Retention:
   Successful and failed valid asks are retained locally by default, including the
   prompt, answer or fixed failure, timestamps, and working directory when available.
-  Files remain until manually removed from:
+  Use session list to recover retained identifiers. Files remain until manually
+  removed; there is no opt-out, delete, retention, or automatic-cleanup command.
   macOS: ~/Library/Application Support/rust-agent-harness/sessions/
   Linux: $XDG_DATA_HOME/rust-agent-harness/sessions/ or
          ~/.local/share/rust-agent-harness/sessions/
@@ -113,8 +115,8 @@ Output:
 Retention:
   Successful and failed valid asks are retained locally by default, including the
   prompt, answer or fixed failure, timestamps, and working directory when available.
-  The stderr Session line is the only CLI handle. Files remain until manually removed;
-  there is no opt-out, list, delete, retention, or automatic-cleanup command.
+  Use session list to recover retained identifiers. Files remain until manually
+  removed; there is no opt-out, delete, retention, or automatic-cleanup command.
   macOS: ~/Library/Application Support/rust-agent-harness/sessions/
   Linux: $XDG_DATA_HOME/rust-agent-harness/sessions/ or
          ~/.local/share/rust-agent-harness/sessions/
@@ -122,21 +124,37 @@ Retention:
 Options:
   -h, --help  Print help
 ";
-const SESSION_HELP: &str = "Inspect a retained session
+const SESSION_HELP: &str = "Inspect retained sessions
 
 Usage: harness session [OPTIONS] [COMMAND]
 
 Commands:
+  list  List retained sessions
   show  Show one retained session by identifier
 
 Retention:
   Successful and failed valid asks are retained locally by default, including the
   prompt, answer or fixed failure, timestamps, and working directory when available.
-  The stderr Session line is the only CLI handle. Files remain until manually removed;
-  there is no opt-out, list, delete, retention, or automatic-cleanup command.
+  Use session list to recover retained identifiers. Files remain until manually
+  removed; there is no opt-out, delete, retention, or automatic-cleanup command.
   macOS: ~/Library/Application Support/rust-agent-harness/sessions/
   Linux: $XDG_DATA_HOME/rust-agent-harness/sessions/ or
          ~/.local/share/rust-agent-harness/sessions/
+
+Options:
+  -h, --help  Print help
+";
+const SESSION_LIST_HELP: &str = "List retained sessions
+
+Usage: harness session list [OPTIONS]
+
+Output:
+  Metadata only: session identifier, creation time in Unix milliseconds, and status
+  Newest created sessions appear first
+
+Limits:
+  At most 4096 directory entries, 4096 session files, and 67108864 aggregate bytes
+  are inspected
 
 Options:
   -h, --help  Print help
@@ -163,6 +181,7 @@ const MODEL_USAGE: &str = "harness model [OPTIONS] [COMMAND]";
 const MODEL_TEST_USAGE: &str = "harness model test [OPTIONS] <PROVIDER>";
 const ASK_USAGE: &str = "harness ask [OPTIONS] <PROVIDER> <PROMPT>";
 const SESSION_USAGE: &str = "harness session [OPTIONS] [COMMAND]";
+const SESSION_LIST_USAGE: &str = "harness session list [OPTIONS]";
 const SESSION_SHOW_USAGE: &str = "harness session show [OPTIONS] <SESSION_ID>";
 const MAX_PROMPT_BYTES: usize = 32 * 1024;
 const MAX_DIAGNOSTIC_ARGUMENT_CHARS: usize = 256;
@@ -224,6 +243,7 @@ trait ModelAction {
 
 trait SessionAction {
     fn start(&mut self, prompt: &str) -> Result<Box<dyn SessionWriteAction>, CreateError>;
+    fn list(&mut self) -> Result<ListResult, ListError>;
     fn show(&mut self, session_id: &str) -> Result<ShowResult, ShowError>;
 }
 
@@ -297,6 +317,10 @@ impl SessionAction for ProductionSession {
         self.log.start(prompt).map(|writer| {
             Box::new(ProductionSessionWriter { writer }) as Box<dyn SessionWriteAction>
         })
+    }
+
+    fn list(&mut self) -> Result<ListResult, ListError> {
+        self.log.list()
     }
 
     fn show(&mut self, session_id: &str) -> Result<ShowResult, ShowError> {
@@ -374,6 +398,8 @@ enum Command<'a> {
     AskOpenAiCodex(&'a str),
     InvalidPrompt,
     SessionHelp,
+    SessionListHelp,
+    SessionList,
     SessionShowHelp,
     SessionShow(&'a str),
     AuthHelp,
@@ -410,6 +436,10 @@ fn run_application(
         Command::SessionHelp => {
             Completion::stdout(ExitCode::SUCCESS, write!(stdout, "{SESSION_HELP}"))
         }
+        Command::SessionListHelp => {
+            Completion::stdout(ExitCode::SUCCESS, write!(stdout, "{SESSION_LIST_HELP}"))
+        }
+        Command::SessionList => run_session_list(stdout, stderr, actions.session),
         Command::SessionShowHelp => {
             Completion::stdout(ExitCode::SUCCESS, write!(stdout, "{SESSION_SHOW_HELP}"))
         }
@@ -472,6 +502,19 @@ fn parse_session(arguments: &[OsString]) -> Command<'_> {
         return arguments.get(2).map_or(Command::SessionHelp, |trailing| {
             usage_error(trailing, SESSION_USAGE)
         });
+    }
+    if command == OsStr::new("list") {
+        let Some(argument) = arguments.get(2) else {
+            return Command::SessionList;
+        };
+        if is_help(argument) {
+            return arguments
+                .get(3)
+                .map_or(Command::SessionListHelp, |trailing| {
+                    usage_error(trailing, SESSION_LIST_USAGE)
+                });
+        }
+        return usage_error(argument, SESSION_LIST_USAGE);
     }
     if command != OsStr::new("show") {
         return usage_error(command, SESSION_USAGE);
@@ -815,6 +858,72 @@ fn model_failure_code(error: ModelError) -> FailureCode {
     }
 }
 
+fn run_session_list(
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+    session: &mut dyn SessionAction,
+) -> Completion {
+    let listed = match session.list() {
+        Ok(listed) => listed,
+        Err(error) => {
+            return Completion::stderr(ExitCode::FAILURE, writeln!(stderr, "error: {error}"));
+        }
+    };
+    let rendered = render_session_list(&listed);
+    let stdout_result = stdout.write_all(rendered.as_bytes());
+    let mut stderr_result = Ok(());
+    for entry in listed
+        .entries()
+        .iter()
+        .filter(|entry| entry.has_trailing_fragment())
+    {
+        retain_first_error(
+            &mut stderr_result,
+            writeln!(
+                stderr,
+                "warning: session {}: {TRAILING_FRAGMENT_WARNING}",
+                entry.session_id()
+            ),
+        );
+    }
+    if stdout_result
+        .as_ref()
+        .is_err_and(|error| error.kind() != ErrorKind::BrokenPipe)
+    {
+        retain_first_error(
+            &mut stderr_result,
+            writeln!(stderr, "error: unable to write session list"),
+        );
+    }
+    Completion::streams(ExitCode::SUCCESS, stdout_result, stderr_result)
+}
+
+fn render_session_list(listed: &ListResult) -> String {
+    use std::fmt::Write as _;
+
+    if listed.entries().is_empty() {
+        return "No retained sessions.\n".to_owned();
+    }
+    let mut rendered = String::from("SESSION\tCREATED_UNIX_MS\tSTATUS\n");
+    for entry in listed.entries() {
+        let created_at = entry
+            .created_at_unix_ms()
+            .map_or_else(|| "-".to_owned(), |value| value.to_string());
+        let status = match entry.status() {
+            ListedSessionStatus::Completed => "completed",
+            ListedSessionStatus::Failed => "failed",
+            ListedSessionStatus::Interrupted => "interrupted",
+            ListedSessionStatus::Busy => "busy",
+            ListedSessionStatus::Corrupt => "corrupt",
+            ListedSessionStatus::Unsupported => "unsupported",
+            ListedSessionStatus::Unavailable => "unavailable",
+        };
+        writeln!(rendered, "{}\t{created_at}\t{status}", entry.session_id())
+            .expect("writing to a String cannot fail");
+    }
+    rendered
+}
+
 fn run_session_show(
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
@@ -1042,6 +1151,7 @@ mod tests {
     #[derive(Default)]
     struct FakeSessionState {
         starts: usize,
+        lists: usize,
         shows: usize,
         rollbacks: usize,
         prompts: Vec<String>,
@@ -1054,6 +1164,8 @@ mod tests {
         start_error: Option<CreateError>,
         append_error: Option<AppendError>,
         rollback_error: Option<RollbackError>,
+        list_error: Option<ListError>,
+        list_log: SessionLog,
         show_result: Result<ShowResult, ShowError>,
         events: Option<Rc<RefCell<Vec<&'static str>>>>,
     }
@@ -1086,6 +1198,11 @@ mod tests {
         fn show(&mut self, _session_id: &str) -> Result<ShowResult, ShowError> {
             self.state.borrow_mut().shows += 1;
             self.show_result.clone()
+        }
+
+        fn list(&mut self) -> Result<ListResult, ListError> {
+            self.state.borrow_mut().lists += 1;
+            self.list_error.map_or_else(|| self.list_log.list(), Err)
         }
     }
 
@@ -1203,11 +1320,21 @@ mod tests {
     }
 
     fn fake_session_success() -> FakeSession {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        static NEXT_LIST_ROOT: AtomicU64 = AtomicU64::new(0);
+        let list_root = env::temp_dir().join(format!(
+            "rust-agent-harness-cli-fake-list-{}-{}",
+            std::process::id(),
+            NEXT_LIST_ROOT.fetch_add(1, Ordering::Relaxed)
+        ));
         FakeSession {
             state: Rc::new(RefCell::new(FakeSessionState::default())),
             start_error: None,
             append_error: None,
             rollback_error: None,
+            list_error: None,
+            list_log: SessionLog::at_data_local_dir(list_root),
             show_result: Err(ShowError::Missing),
             events: None,
         }
@@ -1427,6 +1554,349 @@ mod tests {
                 let _ = std::fs::remove_dir_all(&self.0);
             }
         }
+    }
+
+    fn write_list_fixture(
+        root: &std::path::Path,
+        session_id: &str,
+        created_at_unix_ms: u64,
+        terminal: Option<ListedSessionStatus>,
+        trailing_fragment: bool,
+    ) {
+        let sessions = root.join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o700)).unwrap();
+            std::fs::set_permissions(&sessions, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let operation_id = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+        let user_entry_id = "dddddddddddddddddddddddddddddddd";
+        let terminal_entry_id = "cccccccccccccccccccccccccccccccc";
+        let private_content = concat!(
+            "prompt-origin-sentinel credential-origin-sentinel ",
+            "authorization-origin-sentinel callback-origin-sentinel ",
+            "state-origin-sentinel verifier-origin-sentinel ",
+            "correlation-origin-sentinel environment-origin-sentinel ",
+            "raw-provider-origin-sentinel"
+        );
+        let mut bytes = format!(
+            "{{\"record_type\":\"session_header\",\"format_version\":1,\"session_id\":\"{session_id}\",\"created_at_unix_ms\":{created_at_unix_ms},\"working_directory\":null,\"harness_version\":\"0.1.0\"}}\n{{\"record_type\":\"entry\",\"entry_id\":\"{user_entry_id}\",\"parent_entry_id\":null,\"sequence\":1,\"timestamp_unix_ms\":1,\"operation_id\":\"{operation_id}\",\"payload\":{{\"type\":\"user_message\",\"provider\":\"openai-codex\",\"text\":\"{private_content}\"}}}}\n"
+        );
+        match terminal {
+            Some(ListedSessionStatus::Completed) => bytes.push_str(&format!(
+                "{{\"record_type\":\"entry\",\"entry_id\":\"{terminal_entry_id}\",\"parent_entry_id\":\"{user_entry_id}\",\"sequence\":2,\"timestamp_unix_ms\":2,\"operation_id\":\"{operation_id}\",\"payload\":{{\"type\":\"assistant_message\",\"provider\":\"openai-codex\",\"text\":\"answer-origin-token-sentinel\",\"operation_outcome\":\"completed\"}}}}\n"
+            )),
+            Some(ListedSessionStatus::Failed) => bytes.push_str(&format!(
+                "{{\"record_type\":\"entry\",\"entry_id\":\"{terminal_entry_id}\",\"parent_entry_id\":\"{user_entry_id}\",\"sequence\":2,\"timestamp_unix_ms\":2,\"operation_id\":\"{operation_id}\",\"payload\":{{\"type\":\"terminal_failure\",\"provider\":\"openai-codex\",\"failure_code\":\"rate_limited\",\"diagnostic\":\"{}\",\"operation_outcome\":\"failed\"}}}}\n",
+                FailureCode::RateLimited.diagnostic()
+            )),
+            None | Some(ListedSessionStatus::Interrupted) => {}
+            Some(_) => unreachable!("fixtures create only strictly projectable sessions"),
+        }
+        if trailing_fragment {
+            bytes.push_str("incomplete-trailing-content-sentinel");
+        }
+        let path = sessions.join(format!("{session_id}.jsonl"));
+        std::fs::write(&path, bytes).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+    }
+
+    #[test]
+    fn session_list_renders_every_status_warning_and_no_retained_content() {
+        let completed = "11111111111111111111111111111111";
+        let failed = "22222222222222222222222222222222";
+        let interrupted = "33333333333333333333333333333333";
+        let corrupt = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let unsupported = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let unavailable = "ffffffffffffffffffffffffffffffff";
+        let root = TempRoot::new("list-output");
+        write_list_fixture(
+            &root.0,
+            completed,
+            300,
+            Some(ListedSessionStatus::Completed),
+            true,
+        );
+        write_list_fixture(
+            &root.0,
+            failed,
+            200,
+            Some(ListedSessionStatus::Failed),
+            false,
+        );
+        write_list_fixture(
+            &root.0,
+            interrupted,
+            100,
+            Some(ListedSessionStatus::Interrupted),
+            true,
+        );
+        let sessions = root.0.join("sessions");
+        let corrupt_path = sessions.join(format!("{corrupt}.jsonl"));
+        std::fs::write(&corrupt_path, b"corrupt-private-content\n").unwrap();
+        let unsupported_path = sessions.join(format!("{unsupported}.jsonl"));
+        std::fs::write(
+            &unsupported_path,
+            format!(
+                "{{\"record_type\":\"session_header\",\"format_version\":2,\"session_id\":\"{unsupported}\",\"created_at_unix_ms\":999,\"working_directory\":null,\"harness_version\":\"0.1.0\"}}\n"
+            ),
+        )
+        .unwrap();
+        std::fs::create_dir(sessions.join(format!("{unavailable}.jsonl"))).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            for path in [&corrupt_path, &unsupported_path] {
+                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+            }
+        }
+
+        let mut log = SessionLog::at_data_local_dir(root.0.clone());
+        let busy_writer = log.start("busy-private-content").unwrap();
+        let busy = busy_writer.session_id().to_owned();
+        let debug = format!("{:?}", log.list().unwrap());
+        let mut session = ProductionSession::with_log(log);
+        let arguments: Vec<_> = ["session", "list"]
+            .into_iter()
+            .map(OsString::from)
+            .collect();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let completion = run_application_with_session(
+            &arguments,
+            &mut stdout,
+            &mut stderr,
+            test_actions(
+                &mut fake_success(),
+                &mut fake_logout_success(),
+                &mut fake_status_success(),
+                &mut fake_model_success(),
+                &mut session,
+            ),
+        );
+        assert_eq!(complete(completion), ExitCode::SUCCESS);
+
+        let mut unhealthy = vec![
+            (busy.as_str(), "busy"),
+            (corrupt, "corrupt"),
+            (unsupported, "unsupported"),
+            (unavailable, "unavailable"),
+        ];
+        unhealthy.sort_unstable_by_key(|(session_id, _)| *session_id);
+        let mut expected = format!(
+            "SESSION\tCREATED_UNIX_MS\tSTATUS\n{completed}\t300\tcompleted\n{failed}\t200\tfailed\n{interrupted}\t100\tinterrupted\n"
+        );
+        for (session_id, status) in unhealthy {
+            expected.push_str(&format!("{session_id}\t-\t{status}\n"));
+        }
+        assert_eq!(String::from_utf8(stdout).unwrap(), expected);
+        assert_eq!(
+            String::from_utf8(stderr).unwrap(),
+            format!(
+                "warning: session {completed}: {TRAILING_FRAGMENT_WARNING}\nwarning: session {interrupted}: {TRAILING_FRAGMENT_WARNING}\n"
+            )
+        );
+        for forbidden in [
+            "prompt-origin-sentinel",
+            "credential-origin-sentinel",
+            "authorization-origin-sentinel",
+            "callback-origin-sentinel",
+            "state-origin-sentinel",
+            "verifier-origin-sentinel",
+            "correlation-origin-sentinel",
+            "environment-origin-sentinel",
+            "raw-provider-origin-sentinel",
+            "answer-origin-token-sentinel",
+            "incomplete-trailing-content-sentinel",
+            "busy-private-content",
+            "corrupt-private-content",
+            FailureCode::RateLimited.diagnostic(),
+        ] {
+            assert!(!expected.contains(forbidden));
+            assert!(!debug.contains(forbidden));
+        }
+        drop(busy_writer);
+    }
+
+    #[test]
+    fn session_list_errors_and_stream_failures_invoke_the_action_once() {
+        for (error, diagnostic) in [
+            (ListError::StoreUnavailable, "unable to list local sessions"),
+            (
+                ListError::InventoryTooLarge,
+                "local session inventory exceeds the supported list bound; remove old session files from the directory shown by 'harness session --help'",
+            ),
+        ] {
+            let mut session = fake_session_success();
+            session.list_error = Some(error);
+            let (status, stdout, stderr) = run_with_actions_and_session(
+                &["session", "list"],
+                &mut fake_success(),
+                &mut fake_logout_success(),
+                &mut fake_status_success(),
+                &mut fake_model_success(),
+                &mut session,
+            );
+            assert_eq!(status, ExitCode::FAILURE);
+            assert!(stdout.is_empty());
+            assert_eq!(stderr, format!("error: {diagnostic}\n"));
+            assert_eq!(session.state.borrow().lists, 1);
+        }
+
+        let arguments: Vec<_> = ["session", "list"]
+            .into_iter()
+            .map(OsString::from)
+            .collect();
+        let mut session = fake_session_success();
+        let completion = run_application_with_session(
+            &arguments,
+            &mut BrokenWriter,
+            &mut Vec::new(),
+            test_actions(
+                &mut fake_success(),
+                &mut fake_logout_success(),
+                &mut fake_status_success(),
+                &mut fake_model_success(),
+                &mut session,
+            ),
+        );
+        assert_eq!(complete(completion), ExitCode::SUCCESS);
+        assert_eq!(session.state.borrow().lists, 1);
+
+        let mut session = fake_session_success();
+        let mut stderr = Vec::new();
+        let completion = run_application_with_session(
+            &arguments,
+            &mut FailedWriter,
+            &mut stderr,
+            test_actions(
+                &mut fake_success(),
+                &mut fake_logout_success(),
+                &mut fake_status_success(),
+                &mut fake_model_success(),
+                &mut session,
+            ),
+        );
+        assert_eq!(complete(completion), ExitCode::FAILURE);
+        assert_eq!(
+            String::from_utf8(stderr).unwrap(),
+            "error: unable to write session list\n"
+        );
+        assert_eq!(session.state.borrow().lists, 1);
+
+        let mut session = fake_session_success();
+        let completion = run_application_with_session(
+            &arguments,
+            &mut FailedWriter,
+            &mut BrokenWriter,
+            test_actions(
+                &mut fake_success(),
+                &mut fake_logout_success(),
+                &mut fake_status_success(),
+                &mut fake_model_success(),
+                &mut session,
+            ),
+        );
+        assert_eq!(complete(completion), ExitCode::FAILURE);
+        assert_eq!(session.state.borrow().lists, 1);
+
+        struct CountingListSession {
+            log: SessionLog,
+            calls: usize,
+        }
+
+        impl SessionAction for CountingListSession {
+            fn start(&mut self, _prompt: &str) -> Result<Box<dyn SessionWriteAction>, CreateError> {
+                unreachable!()
+            }
+
+            fn list(&mut self) -> Result<ListResult, ListError> {
+                self.calls += 1;
+                self.log.list()
+            }
+
+            fn show(&mut self, _session_id: &str) -> Result<ShowResult, ShowError> {
+                unreachable!()
+            }
+        }
+
+        let root = TempRoot::new("list-streams");
+        write_list_fixture(
+            &root.0,
+            SESSION_ID,
+            1,
+            Some(ListedSessionStatus::Interrupted),
+            true,
+        );
+        let mut session = CountingListSession {
+            log: SessionLog::at_data_local_dir(root.0.clone()),
+            calls: 0,
+        };
+        let completion = run_application_with_session(
+            &arguments,
+            &mut Vec::new(),
+            &mut BrokenWriter,
+            test_actions(
+                &mut fake_success(),
+                &mut fake_logout_success(),
+                &mut fake_status_success(),
+                &mut fake_model_success(),
+                &mut session,
+            ),
+        );
+        assert_eq!(complete(completion), ExitCode::SUCCESS);
+        assert_eq!(session.calls, 1);
+
+        let completion = run_application_with_session(
+            &arguments,
+            &mut Vec::new(),
+            &mut FailedWriter,
+            test_actions(
+                &mut fake_success(),
+                &mut fake_logout_success(),
+                &mut fake_status_success(),
+                &mut fake_model_success(),
+                &mut session,
+            ),
+        );
+        assert_eq!(complete(completion), ExitCode::FAILURE);
+        assert_eq!(session.calls, 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_session_list_argument_never_invokes_the_action() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let arguments = vec![
+            OsString::from("session"),
+            OsString::from("list"),
+            OsString::from_vec(vec![0xff]),
+        ];
+        let mut session = fake_session_success();
+        let completion = run_application_with_session(
+            &arguments,
+            &mut Vec::new(),
+            &mut Vec::new(),
+            test_actions(
+                &mut fake_success(),
+                &mut fake_logout_success(),
+                &mut fake_status_success(),
+                &mut fake_model_success(),
+                &mut session,
+            ),
+        );
+        assert_eq!(complete(completion), ExitCode::from(2));
+        assert_eq!(session.state.borrow().lists, 0);
     }
 
     #[test]
@@ -1760,6 +2230,9 @@ mod tests {
     #[test]
     fn session_command_grammar_is_narrow_and_non_session_commands_are_ephemeral() {
         for arguments in [
+            &["session", "list", "extra"][..],
+            &["session", "list", "--"][..],
+            &["session", "list", "--help", "extra"][..],
             &["session", "show"][..],
             &["session", "show", "ABCDEFABCDEFABCDEFABCDEFABCDEFAB"][..],
             &["session", "show", "../../etc/passwd"][..],
@@ -1778,12 +2251,15 @@ mod tests {
                 &mut session,
             );
             assert_eq!(status, ExitCode::from(2), "{arguments:?}");
+            assert_eq!(session.state.borrow().lists, 0);
             assert_eq!(session.state.borrow().shows, 0);
         }
 
         for arguments in [
             &["session"][..],
             &["session", "--help"][..],
+            &["session", "list", "-h"][..],
+            &["session", "list", "--help"][..],
             &["session", "show", "--help"][..],
         ] {
             let mut session = fake_session_success();
@@ -1798,8 +2274,24 @@ mod tests {
             assert_eq!(status, ExitCode::SUCCESS);
             assert!(!stdout.is_empty());
             assert!(stderr.is_empty());
+            assert_eq!(session.state.borrow().lists, 0);
             assert_eq!(session.state.borrow().shows, 0);
         }
+
+        let mut session = fake_session_success();
+        let (status, stdout, stderr) = run_with_actions_and_session(
+            &["session", "list"],
+            &mut fake_success(),
+            &mut fake_logout_success(),
+            &mut fake_status_success(),
+            &mut fake_model_success(),
+            &mut session,
+        );
+        assert_eq!(status, ExitCode::SUCCESS);
+        assert_eq!(stdout, "No retained sessions.\n");
+        assert!(stderr.is_empty());
+        assert_eq!(session.state.borrow().lists, 1);
+        assert_eq!(session.state.borrow().shows, 0);
 
         let mut session = fake_session_success();
         let (status, stdout, stderr) = run_with_actions_and_session(
@@ -1832,6 +2324,7 @@ mod tests {
             );
             let state = session.state.borrow();
             assert_eq!(state.starts, 0, "{arguments:?}");
+            assert_eq!(state.lists, 0, "{arguments:?}");
             assert_eq!(state.shows, 0, "{arguments:?}");
         }
     }

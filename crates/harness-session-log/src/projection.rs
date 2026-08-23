@@ -4,6 +4,7 @@ use crate::format::{
     FORMAT_VERSION, FailureCode, MAX_DIAGNOSTIC_BYTES, MAX_RECORD_BYTES, MAX_SESSION_BYTES,
     Payload, Record,
 };
+use crate::{ListedSessionStatus, SessionSummary};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SessionStatus {
@@ -21,6 +22,7 @@ pub enum ProjectedTerminal {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SessionProjection {
     session_id: String,
+    created_at_unix_ms: u64,
     prompt: String,
     status: SessionStatus,
     terminal: Option<ProjectedTerminal>,
@@ -29,6 +31,10 @@ pub struct SessionProjection {
 impl SessionProjection {
     pub fn session_id(&self) -> &str {
         &self.session_id
+    }
+
+    pub fn created_at_unix_ms(&self) -> u64 {
+        self.created_at_unix_ms
     }
 
     pub fn prompt(&self) -> &str {
@@ -58,6 +64,20 @@ impl ShowResult {
     pub fn has_trailing_fragment(&self) -> bool {
         self.trailing_fragment
     }
+
+    pub(crate) fn into_summary(self) -> SessionSummary {
+        let status = match self.projection.status {
+            SessionStatus::Completed => ListedSessionStatus::Completed,
+            SessionStatus::Failed => ListedSessionStatus::Failed,
+            SessionStatus::Interrupted => ListedSessionStatus::Interrupted,
+        };
+        SessionSummary {
+            session_id: self.projection.session_id,
+            created_at_unix_ms: Some(self.projection.created_at_unix_ms),
+            status,
+            trailing_fragment: self.trailing_fragment,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -75,6 +95,7 @@ pub(crate) fn project(
     let Some(Record::Header {
         format_version,
         session_id,
+        created_at_unix_ms,
         ..
     }) = records.first()
     else {
@@ -125,6 +146,7 @@ pub(crate) fn project(
     Ok(ShowResult {
         projection: SessionProjection {
             session_id: session_id.clone(),
+            created_at_unix_ms: *created_at_unix_ms,
             prompt: prompt.clone(),
             status,
             terminal,
