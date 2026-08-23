@@ -11,6 +11,9 @@ harness-openai-codex-auth = { path = "../openai-codex-auth" }
 harness-openai-codex-model = { path = "../openai-codex-model" }
 harness-session-log = { path = "../harness-session-log" }
 
+[dev-dependencies]
+proptest = "=1.11.0"
+
 [[bin]]
 name = "harness"
 path = "src/main.rs"

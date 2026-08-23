@@ -331,9 +331,24 @@ fn safe_claim(value: Option<&Value>, maximum_chars: usize) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use proptest::prelude::*;
     use serde_json::json;
 
     use super::*;
+
+    proptest! {
+        #[test]
+        fn fuzz_stored_credentials_fail_closed_without_panicking(
+            serialized in prop::collection::vec(any::<u8>(), 0..4096),
+            now in any::<u64>(),
+        ) {
+            if let Ok(record) = CredentialRecord::deserialize(&serialized, now) {
+                let round_trip = record.serialize().expect("validated credentials serialize");
+                prop_assert!(CredentialRecord::deserialize(&round_trip, now).is_ok());
+            }
+            let _ = CredentialRecord::deserialize_structural(&serialized);
+        }
+    }
 
     fn jwt(payload: Value) -> String {
         format!(

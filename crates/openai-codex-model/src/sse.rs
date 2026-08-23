@@ -307,6 +307,7 @@ fn ensure_text_bound(text: &str, maximum_text_bytes: usize) -> Result<(), Decode
 
 #[cfg(test)]
 mod tests {
+    use proptest::prelude::*;
     use std::io::Cursor;
 
     use super::*;
@@ -341,6 +342,17 @@ mod tests {
             limits(),
             Instant::now(),
         )
+    }
+
+    proptest! {
+        #[test]
+        fn fuzz_sse_decoder_is_bounded_and_panic_free(
+            stream in prop::collection::vec(any::<u8>(), 0..8 * 1024),
+            chunk_size in 1usize..128,
+        ) {
+            let result = decode_text(stream, chunk_size);
+            prop_assert!(result.is_err() || result.as_ref().is_ok_and(|text| text.len() <= 1024));
+        }
     }
 
     #[test]

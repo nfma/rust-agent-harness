@@ -21,3 +21,6 @@ webbrowser = "1.0.3"
 [target.'cfg(target_os = "macos")'.dependencies]
 directories = "6"
 security-framework = "3.1.0"
+
+[dev-dependencies]
+proptest = "=1.11.0"
