@@ -1,6 +1,7 @@
 #[cfg(test)]
 use std::collections::VecDeque;
 use std::env;
+use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
@@ -15,9 +16,28 @@ use crate::format::{
     user_entry,
 };
 use crate::projection::{ProjectionError, ShowResult, project, valid_id};
-use crate::{AppendError, CreateError, RollbackError, ShowError};
+use crate::{
+    AppendError, CreateError, ListError, ListResult, ListedSessionStatus, RollbackError,
+    SessionSummary, ShowError,
+};
 
 const CREATE_RETRIES: usize = 8;
+const MAX_LIST_CANDIDATES: usize = 4096;
+const MAX_LIST_DIRECTORY_ENTRIES: usize = 4096;
+const MAX_LIST_READ_BYTES: u64 = 64 * 1024 * 1024;
+
+#[derive(Clone, Copy)]
+struct ListLimits {
+    candidates: usize,
+    directory_entries: usize,
+    read_bytes: u64,
+}
+
+const LIST_LIMITS: ListLimits = ListLimits {
+    candidates: MAX_LIST_CANDIDATES,
+    directory_entries: MAX_LIST_DIRECTORY_ENTRIES,
+    read_bytes: MAX_LIST_READ_BYTES,
+};
 
 pub struct SessionLog {
     location: Location,
@@ -158,6 +178,22 @@ impl SessionLog {
             } => show_file(application_dir, sessions_dir, session_id),
             #[cfg(test)]
             Location::Memory(store) => show_memory(store, session_id),
+        }
+    }
+
+    pub fn list(&self) -> Result<ListResult, ListError> {
+        self.list_with_limits(LIST_LIMITS)
+    }
+
+    fn list_with_limits(&self, limits: ListLimits) -> Result<ListResult, ListError> {
+        match &self.location {
+            Location::Unavailable => Err(ListError::StoreUnavailable),
+            Location::File {
+                application_dir,
+                sessions_dir,
+            } => list_file(application_dir, sessions_dir, limits),
+            #[cfg(test)]
+            Location::Memory(store) => list_memory(store, limits),
         }
     }
 
@@ -552,6 +588,153 @@ impl Drop for SessionWriter {
     }
 }
 
+fn list_file(
+    application_dir: &Path,
+    sessions_dir: &Path,
+    limits: ListLimits,
+) -> Result<ListResult, ListError> {
+    if !list_directory_exists(application_dir)? || !list_directory_exists(sessions_dir)? {
+        return Ok(ListResult::new(Vec::new()));
+    }
+    let directory = fs::read_dir(sessions_dir).map_err(|_| ListError::StoreUnavailable)?;
+    let candidates = collect_candidate_ids(
+        directory.map(|entry| entry.map(|entry| entry.file_name())),
+        limits,
+    )?;
+    let mut budget = ListReadBudget {
+        used: 0,
+        limit: limits.read_bytes,
+    };
+    summarize_candidates(candidates, |session_id| {
+        inspect_file(
+            &sessions_dir.join(format!("{session_id}.jsonl")),
+            session_id,
+            ReadPolicy::List(&mut budget),
+        )
+    })
+}
+
+fn list_directory_exists(path: &Path) -> Result<bool, ListError> {
+    match validate_private_directory(path) {
+        Ok(()) => Ok(true),
+        Err(ShowError::Missing) => Ok(false),
+        Err(_) => Err(ListError::StoreUnavailable),
+    }
+}
+
+fn collect_candidate_ids<I>(entries: I, limits: ListLimits) -> Result<Vec<String>, ListError>
+where
+    I: IntoIterator<Item = io::Result<OsString>>,
+{
+    let mut directory_entries = 0_usize;
+    let mut candidates = Vec::new();
+    for entry in entries {
+        let file_name = entry.map_err(|_| ListError::StoreUnavailable)?;
+        directory_entries = directory_entries
+            .checked_add(1)
+            .ok_or(ListError::InventoryTooLarge)?;
+        if directory_entries > limits.directory_entries {
+            return Err(ListError::InventoryTooLarge);
+        }
+        let Some(session_id) = canonical_session_id(&file_name) else {
+            continue;
+        };
+        if candidates
+            .len()
+            .checked_add(1)
+            .is_none_or(|count| count > limits.candidates)
+        {
+            return Err(ListError::InventoryTooLarge);
+        }
+        candidates.push(session_id);
+    }
+    candidates.sort_unstable();
+    Ok(candidates)
+}
+
+fn canonical_session_id(file_name: &OsStr) -> Option<String> {
+    let file_name = file_name.to_str()?;
+    let session_id = file_name.strip_suffix(".jsonl")?;
+    valid_id(session_id).then(|| session_id.to_owned())
+}
+
+fn summarize_candidates<F>(candidates: Vec<String>, mut inspect: F) -> Result<ListResult, ListError>
+where
+    F: FnMut(&str) -> Result<ShowResult, FileInspectionError>,
+{
+    let mut summaries = Vec::with_capacity(candidates.len());
+    for session_id in candidates {
+        match inspect(&session_id) {
+            Ok(shown) => summaries.push(shown.into_summary()),
+            Err(FileInspectionError::InventoryTooLarge) => {
+                return Err(ListError::InventoryTooLarge);
+            }
+            Err(FileInspectionError::Show(ShowError::Missing)) => {}
+            Err(FileInspectionError::Show(error)) => {
+                let status = match error {
+                    ShowError::Busy => ListedSessionStatus::Busy,
+                    ShowError::UnsupportedVersion => ListedSessionStatus::Unsupported,
+                    ShowError::Corrupt => ListedSessionStatus::Corrupt,
+                    ShowError::StoreUnavailable => ListedSessionStatus::Unavailable,
+                    ShowError::InvalidSessionId => {
+                        unreachable!("canonical session filename produced an invalid identifier")
+                    }
+                    ShowError::Missing => unreachable!("missing candidates are handled above"),
+                };
+                summaries.push(SessionSummary::unprojectable(session_id, status));
+            }
+        }
+    }
+    summaries.sort_by(|left, right| {
+        match (left.created_at_unix_ms(), right.created_at_unix_ms()) {
+            (Some(left_time), Some(right_time)) => right_time
+                .cmp(&left_time)
+                .then_with(|| left.session_id().cmp(right.session_id())),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => left.session_id().cmp(right.session_id()),
+        }
+    });
+    Ok(ListResult::new(summaries))
+}
+
+#[cfg(test)]
+fn list_memory(
+    store: &Arc<Mutex<MemoryStore>>,
+    limits: ListLimits,
+) -> Result<ListResult, ListError> {
+    let store = store.lock().map_err(|_| ListError::StoreUnavailable)?;
+    let candidates = collect_candidate_ids(
+        store
+            .files
+            .keys()
+            .map(|session_id| Ok(OsString::from(format!("{session_id}.jsonl")))),
+        limits,
+    )?;
+    let mut budget = ListReadBudget {
+        used: 0,
+        limit: limits.read_bytes,
+    };
+    summarize_candidates(candidates, |session_id| {
+        let file = store
+            .files
+            .get(session_id)
+            .ok_or(ShowError::Missing)
+            .map_err(FileInspectionError::Show)?;
+        if file.locked {
+            return Err(FileInspectionError::Show(ShowError::Busy));
+        }
+        if file.bytes.len() > MAX_SESSION_BYTES {
+            return Err(FileInspectionError::Show(ShowError::Corrupt));
+        }
+        let size = u64::try_from(file.bytes.len())
+            .map_err(|_| FileInspectionError::Show(ShowError::Corrupt))?;
+        budget.charge(size)?;
+        project(&file.bytes, session_id)
+            .map_err(|error| FileInspectionError::Show(map_projection_error(error)))
+    })
+}
+
 fn show_file(
     application_dir: &Path,
     sessions_dir: &Path,
@@ -560,41 +743,126 @@ fn show_file(
     validate_private_directory(application_dir)?;
     validate_private_directory(sessions_dir)?;
     let path = sessions_dir.join(format!("{session_id}.jsonl"));
-    let path_metadata = fs::symlink_metadata(&path).map_err(map_open_error)?;
+    inspect_file(&path, session_id, ReadPolicy::Show).map_err(|error| match error {
+        FileInspectionError::Show(error) => error,
+        FileInspectionError::InventoryTooLarge => {
+            unreachable!("show does not use the aggregate list budget")
+        }
+    })
+}
+
+struct ListReadBudget {
+    used: u64,
+    limit: u64,
+}
+
+impl ListReadBudget {
+    fn charge(&mut self, size: u64) -> Result<(), FileInspectionError> {
+        let next = self
+            .used
+            .checked_add(size)
+            .ok_or(FileInspectionError::InventoryTooLarge)?;
+        if next > self.limit {
+            return Err(FileInspectionError::InventoryTooLarge);
+        }
+        self.used = next;
+        Ok(())
+    }
+}
+
+enum ReadPolicy<'a> {
+    Show,
+    List(&'a mut ListReadBudget),
+}
+
+enum FileInspectionError {
+    Show(ShowError),
+    InventoryTooLarge,
+}
+
+impl From<ShowError> for FileInspectionError {
+    fn from(error: ShowError) -> Self {
+        Self::Show(error)
+    }
+}
+
+fn inspect_file(
+    path: &Path,
+    session_id: &str,
+    policy: ReadPolicy<'_>,
+) -> Result<ShowResult, FileInspectionError> {
+    inspect_file_with_hook(path, session_id, policy, |_, _| {})
+}
+
+fn inspect_file_with_hook<F>(
+    path: &Path,
+    session_id: &str,
+    policy: ReadPolicy<'_>,
+    before_read: F,
+) -> Result<ShowResult, FileInspectionError>
+where
+    F: FnOnce(&File, &Path),
+{
+    let path_metadata = fs::symlink_metadata(path).map_err(map_open_error)?;
     if path_metadata.file_type().is_symlink() || !path_metadata.is_file() {
-        return Err(ShowError::StoreUnavailable);
+        return Err(ShowError::StoreUnavailable.into());
     }
     let mut file = OpenOptions::new()
         .read(true)
-        .open(&path)
+        .open(path)
         .map_err(map_open_error)?;
-    if !identity_matches(&file, &path) || !private_file_permissions(&file) {
-        return Err(ShowError::StoreUnavailable);
+    if !identity_matches(&file, path) || !private_file_permissions(&file) {
+        return Err(ShowError::StoreUnavailable.into());
     }
     match FileExt::try_lock_shared(&file) {
         Ok(()) => {}
-        Err(TryLockError::WouldBlock) => return Err(ShowError::Busy),
-        Err(TryLockError::Error(_)) => return Err(ShowError::StoreUnavailable),
+        Err(TryLockError::WouldBlock) => return Err(ShowError::Busy.into()),
+        Err(TryLockError::Error(_)) => return Err(ShowError::StoreUnavailable.into()),
     }
     let size = file
         .metadata()
         .map_err(|_| ShowError::StoreUnavailable)?
         .len();
     if size > MAX_SESSION_BYTES as u64 {
-        return Err(ShowError::Corrupt);
+        return Err(ShowError::Corrupt.into());
     }
-    let mut bytes = Vec::with_capacity(usize::try_from(size).unwrap_or(MAX_SESSION_BYTES));
-    Read::by_ref(&mut file)
-        .take(MAX_SESSION_BYTES as u64 + 1)
+    before_read(&file, path);
+    let bytes = match policy {
+        ReadPolicy::Show => {
+            let mut bytes = Vec::with_capacity(usize::try_from(size).unwrap_or(MAX_SESSION_BYTES));
+            Read::by_ref(&mut file)
+                .take(MAX_SESSION_BYTES as u64 + 1)
+                .read_to_end(&mut bytes)
+                .map_err(|_| ShowError::StoreUnavailable)?;
+            if bytes.len() > MAX_SESSION_BYTES || !identity_matches(&file, path) {
+                return Err(ShowError::Corrupt.into());
+            }
+            bytes
+        }
+        ReadPolicy::List(budget) => {
+            budget.charge(size)?;
+            let expected_size =
+                usize::try_from(size).map_err(|_| FileInspectionError::Show(ShowError::Corrupt))?;
+            let bytes = read_captured_bytes(&mut file, size)?;
+            let unchanged_size = file.metadata().is_ok_and(|metadata| metadata.len() == size);
+            if bytes.len() != expected_size || !unchanged_size || !identity_matches(&file, path) {
+                return Err(ShowError::Corrupt.into());
+            }
+            bytes
+        }
+    };
+    project(&bytes, session_id)
+        .map_err(|error| FileInspectionError::Show(map_projection_error(error)))
+}
+
+fn read_captured_bytes(reader: &mut dyn Read, size: u64) -> Result<Vec<u8>, ShowError> {
+    let capacity = usize::try_from(size).map_err(|_| ShowError::Corrupt)?;
+    let mut bytes = Vec::with_capacity(capacity);
+    reader
+        .take(size)
         .read_to_end(&mut bytes)
         .map_err(|_| ShowError::StoreUnavailable)?;
-    if bytes.len() > MAX_SESSION_BYTES || !identity_matches(&file, &path) {
-        return Err(ShowError::Corrupt);
-    }
-    project(&bytes, session_id).map_err(|error| match error {
-        ProjectionError::UnsupportedVersion => ShowError::UnsupportedVersion,
-        ProjectionError::Corrupt => ShowError::Corrupt,
-    })
+    Ok(bytes)
 }
 
 #[cfg(test)]
@@ -604,10 +872,14 @@ fn show_memory(store: &Arc<Mutex<MemoryStore>>, session_id: &str) -> Result<Show
     if file.locked {
         return Err(ShowError::Busy);
     }
-    project(&file.bytes, session_id).map_err(|error| match error {
+    project(&file.bytes, session_id).map_err(map_projection_error)
+}
+
+fn map_projection_error(error: ProjectionError) -> ShowError {
+    match error {
         ProjectionError::UnsupportedVersion => ShowError::UnsupportedVersion,
         ProjectionError::Corrupt => ShowError::Corrupt,
-    })
+    }
 }
 
 fn map_open_error(error: io::Error) -> ShowError {
@@ -737,12 +1009,23 @@ fn set_private_file_permissions(path: &Path) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ProjectedTerminal, SessionStatus};
+    use crate::{ListedSessionStatus, ProjectedTerminal, SessionStatus};
 
     const SESSION: &str = "00000000000000000000000000000001";
     const OPERATION: &str = "00000000000000000000000000000002";
     const USER: &str = "00000000000000000000000000000003";
     const TERMINAL: &str = "00000000000000000000000000000004";
+    const SECOND_SESSION: &str = "00000000000000000000000000000005";
+    const SECOND_OPERATION: &str = "00000000000000000000000000000006";
+    const SECOND_USER: &str = "00000000000000000000000000000007";
+    const SECOND_TERMINAL: &str = "00000000000000000000000000000008";
+    const THIRD_SESSION: &str = "00000000000000000000000000000009";
+    const THIRD_OPERATION: &str = "0000000000000000000000000000000a";
+    const THIRD_USER: &str = "0000000000000000000000000000000b";
+    const THIRD_TERMINAL: &str = "0000000000000000000000000000000f";
+    const FOURTH_SESSION: &str = "0000000000000000000000000000000c";
+    const FOURTH_OPERATION: &str = "0000000000000000000000000000000d";
+    const FOURTH_USER: &str = "0000000000000000000000000000000e";
 
     fn memory_log() -> SessionLog {
         SessionLog::memory(&[SESSION, OPERATION, USER, TERMINAL], &[0, 0, 1], None)
@@ -789,11 +1072,248 @@ mod tests {
         let shown = log.show(SESSION).unwrap();
         assert!(!shown.has_trailing_fragment());
         assert_eq!(shown.projection().status(), &SessionStatus::Completed);
+        assert_eq!(shown.projection().created_at_unix_ms(), 0);
         assert_eq!(shown.projection().prompt(), "prompt");
         assert_eq!(
             shown.projection().terminal(),
             Some(&ProjectedTerminal::Assistant("answer".to_owned()))
         );
+    }
+
+    #[test]
+    fn list_orders_projected_metadata_and_redacts_all_session_content() {
+        let corrupt_session = "00000000000000000000000000000010";
+        let unsupported_session = "00000000000000000000000000000011";
+        let mut log = SessionLog::memory(
+            &[
+                SESSION,
+                OPERATION,
+                USER,
+                TERMINAL,
+                SECOND_SESSION,
+                SECOND_OPERATION,
+                SECOND_USER,
+                SECOND_TERMINAL,
+                THIRD_SESSION,
+                THIRD_OPERATION,
+                THIRD_USER,
+                FOURTH_SESSION,
+                FOURTH_OPERATION,
+                FOURTH_USER,
+            ],
+            &[100, 101, 102, 300, 301, 302, 200, 201, 400, 401],
+            None,
+        );
+        log.start("prompt-origin-secret-sentinel")
+            .unwrap()
+            .append_assistant("answer-origin-secret-sentinel")
+            .unwrap();
+        log.start("failure-prompt-sentinel")
+            .unwrap()
+            .append_failure(FailureCode::RateLimited)
+            .unwrap();
+        drop(log.start("interrupted-prompt-sentinel").unwrap());
+        let busy_writer = log.start("busy-prompt-sentinel").unwrap();
+
+        let Location::Memory(store) = &log.location else {
+            unreachable!();
+        };
+        let mut store = store.lock().unwrap();
+        store
+            .files
+            .get_mut(SESSION)
+            .unwrap()
+            .bytes
+            .extend_from_slice(b"trailing-content-sentinel");
+        store.files.insert(
+            corrupt_session.to_owned(),
+            MemoryFile {
+                bytes: b"corrupt-content-sentinel\n".to_vec(),
+                locked: false,
+            },
+        );
+        store.files.insert(
+            unsupported_session.to_owned(),
+            MemoryFile {
+                bytes: format!(
+                    "{{\"record_type\":\"session_header\",\"format_version\":2,\"session_id\":\"{unsupported_session}\",\"created_at_unix_ms\":999,\"working_directory\":null,\"harness_version\":\"0.1.0\"}}\n"
+                )
+                .into_bytes(),
+                locked: false,
+            },
+        );
+        drop(store);
+
+        let listed = log.list().unwrap();
+        let entries = listed.entries();
+        assert_eq!(entries.len(), 6);
+        assert_eq!(entries[0].session_id(), SECOND_SESSION);
+        assert_eq!(entries[0].created_at_unix_ms(), Some(300));
+        assert_eq!(entries[0].status(), ListedSessionStatus::Failed);
+        assert_eq!(entries[1].session_id(), THIRD_SESSION);
+        assert_eq!(entries[1].created_at_unix_ms(), Some(200));
+        assert_eq!(entries[1].status(), ListedSessionStatus::Interrupted);
+        assert_eq!(entries[2].session_id(), SESSION);
+        assert_eq!(entries[2].created_at_unix_ms(), Some(100));
+        assert_eq!(entries[2].status(), ListedSessionStatus::Completed);
+        assert!(entries[2].has_trailing_fragment());
+        assert_eq!(entries[3].session_id(), FOURTH_SESSION);
+        assert_eq!(entries[3].created_at_unix_ms(), None);
+        assert_eq!(entries[3].status(), ListedSessionStatus::Busy);
+        assert_eq!(entries[4].session_id(), corrupt_session);
+        assert_eq!(entries[4].status(), ListedSessionStatus::Corrupt);
+        assert_eq!(entries[5].session_id(), unsupported_session);
+        assert_eq!(entries[5].status(), ListedSessionStatus::Unsupported);
+
+        let debug = format!("{listed:?}");
+        for forbidden in [
+            "prompt-origin-secret-sentinel",
+            "answer-origin-secret-sentinel",
+            "failure-prompt-sentinel",
+            "interrupted-prompt-sentinel",
+            "busy-prompt-sentinel",
+            "trailing-content-sentinel",
+            "corrupt-content-sentinel",
+            FailureCode::RateLimited.diagnostic(),
+        ] {
+            assert!(!debug.contains(forbidden));
+        }
+        drop(busy_writer);
+    }
+
+    #[test]
+    fn list_bounds_errors_and_missing_races_are_fail_closed() {
+        let exact_candidates = collect_candidate_ids(
+            (0..MAX_LIST_CANDIDATES).map(|index| Ok(OsString::from(format!("{index:032x}.jsonl")))),
+            LIST_LIMITS,
+        )
+        .unwrap();
+        assert_eq!(exact_candidates.len(), MAX_LIST_CANDIDATES);
+        assert!(
+            summarize_candidates(exact_candidates, |_| {
+                Err(FileInspectionError::Show(ShowError::Missing))
+            })
+            .unwrap()
+            .entries()
+            .is_empty()
+        );
+        assert_eq!(
+            collect_candidate_ids(
+                (0..=MAX_LIST_CANDIDATES)
+                    .map(|index| { Ok(OsString::from(format!("{index:032x}.jsonl"))) }),
+                LIST_LIMITS,
+            ),
+            Err(ListError::InventoryTooLarge)
+        );
+
+        assert!(
+            collect_candidate_ids(
+                (0..MAX_LIST_DIRECTORY_ENTRIES)
+                    .map(|index| Ok(OsString::from(format!("ignored-{index}")))),
+                LIST_LIMITS,
+            )
+            .unwrap()
+            .is_empty()
+        );
+        assert_eq!(
+            collect_candidate_ids(
+                (0..=MAX_LIST_DIRECTORY_ENTRIES)
+                    .map(|index| Ok(OsString::from(format!("ignored-{index}")))),
+                LIST_LIMITS,
+            ),
+            Err(ListError::InventoryTooLarge)
+        );
+
+        assert_eq!(
+            collect_candidate_ids(
+                [Err(io::Error::other("injected read_dir failure"))],
+                LIST_LIMITS,
+            ),
+            Err(ListError::StoreUnavailable)
+        );
+        assert_eq!(
+            collect_candidate_ids(
+                [
+                    Ok(OsString::from(format!("{SESSION}.jsonl"))),
+                    Err(io::Error::other("injected later read_dir failure")),
+                ],
+                LIST_LIMITS,
+            ),
+            Err(ListError::StoreUnavailable)
+        );
+
+        let mut log = memory_log();
+        drop(log.start("prompt").unwrap());
+        let exact_bytes = u64::try_from(log.memory_bytes(SESSION).len()).unwrap();
+        let exact_limits = ListLimits {
+            read_bytes: exact_bytes,
+            ..LIST_LIMITS
+        };
+        assert_eq!(
+            log.list_with_limits(exact_limits).unwrap().entries().len(),
+            1
+        );
+        assert_eq!(
+            log.list_with_limits(ListLimits {
+                read_bytes: exact_bytes - 1,
+                ..LIST_LIMITS
+            }),
+            Err(ListError::InventoryTooLarge)
+        );
+
+        let shown = log.show(SESSION).unwrap();
+        let missing_session = "ffffffffffffffffffffffffffffffff";
+        let listed = summarize_candidates(
+            vec![SESSION.to_owned(), missing_session.to_owned()],
+            |session_id| {
+                if session_id == SESSION {
+                    Ok(shown.clone())
+                } else {
+                    Err(FileInspectionError::Show(ShowError::Missing))
+                }
+            },
+        )
+        .unwrap();
+        assert_eq!(listed.entries().len(), 1);
+        assert_eq!(listed.entries()[0].session_id(), SESSION);
+
+        let candidates = collect_candidate_ids(
+            [
+                Ok(OsString::from("not-a-session.jsonl")),
+                Ok(OsString::from(format!("{SESSION}.jsonl"))),
+            ],
+            LIST_LIMITS,
+        )
+        .unwrap();
+        let mut inspections = 0;
+        let _ = summarize_candidates(candidates, |_| {
+            inspections += 1;
+            Ok(shown.clone())
+        })
+        .unwrap();
+        assert_eq!(inspections, 1);
+
+        let mut overflow = ListReadBudget {
+            used: u64::MAX,
+            limit: u64::MAX,
+        };
+        assert!(matches!(
+            overflow.charge(1),
+            Err(FileInspectionError::InventoryTooLarge)
+        ));
+
+        let Location::Memory(store) = &log.location else {
+            unreachable!();
+        };
+        store.lock().unwrap().files.get_mut(SESSION).unwrap().bytes =
+            vec![b'x'; MAX_SESSION_BYTES + 1];
+        let listed = log
+            .list_with_limits(ListLimits {
+                read_bytes: 0,
+                ..LIST_LIMITS
+            })
+            .unwrap();
+        assert_eq!(listed.entries()[0].status(), ListedSessionStatus::Corrupt);
     }
 
     #[test]
@@ -1074,7 +1594,395 @@ mod tests {
         let root = TempRoot::new("missing");
         let log = SessionLog::at_data_local_dir(root.0.clone());
         assert_eq!(log.show(SESSION), Err(ShowError::Missing));
+        assert!(log.list().unwrap().entries().is_empty());
         assert!(!root.0.exists());
+
+        fs::create_dir(&root.0).unwrap();
+        set_private_directory_permissions(&root.0).unwrap();
+        assert!(log.list().unwrap().entries().is_empty());
+        assert!(!root.0.join("sessions").exists());
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            fs::set_permissions(&root.0, fs::Permissions::from_mode(0o755)).unwrap();
+            assert_eq!(log.list(), Err(ListError::StoreUnavailable));
+            fs::set_permissions(&root.0, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        fs::write(root.0.join("sessions"), b"not a directory").unwrap();
+        assert_eq!(log.list(), Err(ListError::StoreUnavailable));
+
+        let unavailable = SessionLog {
+            location: Location::Unavailable,
+            sources: Arc::new(Mutex::new(Sources::production())),
+        };
+        assert_eq!(unavailable.list(), Err(ListError::StoreUnavailable));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_list_uses_header_time_and_preserves_every_canonical_byte() {
+        use std::fs::FileTimes;
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        use std::time::Duration;
+
+        let root = TempRoot::new("list-order");
+        let mut log = SessionLog::fixed_file(
+            root.0.clone(),
+            &[
+                SESSION,
+                OPERATION,
+                USER,
+                TERMINAL,
+                SECOND_SESSION,
+                SECOND_OPERATION,
+                SECOND_USER,
+                SECOND_TERMINAL,
+                THIRD_SESSION,
+                THIRD_OPERATION,
+                THIRD_USER,
+                THIRD_TERMINAL,
+            ],
+            &[900, 901, 902, 900, 903, 904, 100, 905, 906],
+            None,
+        );
+        log.start("first prompt")
+            .unwrap()
+            .append_assistant("first answer")
+            .unwrap();
+        log.start("second prompt")
+            .unwrap()
+            .append_assistant("second answer")
+            .unwrap();
+        log.start("third prompt")
+            .unwrap()
+            .append_assistant("third answer")
+            .unwrap();
+
+        let sessions = root.0.join("sessions");
+        let first = sessions.join(format!("{SESSION}.jsonl"));
+        let second = sessions.join(format!("{SECOND_SESSION}.jsonl"));
+        let third = sessions.join(format!("{THIRD_SESSION}.jsonl"));
+        OpenOptions::new()
+            .append(true)
+            .open(&second)
+            .unwrap()
+            .write_all(b"trailing-fragment-sentinel")
+            .unwrap();
+        for (path, modified) in [
+            (&first, UNIX_EPOCH + Duration::from_secs(1)),
+            (&second, UNIX_EPOCH + Duration::from_secs(2)),
+            (&third, UNIX_EPOCH + Duration::from_secs(3)),
+        ] {
+            File::open(path)
+                .unwrap()
+                .set_times(FileTimes::new().set_modified(modified))
+                .unwrap();
+        }
+
+        let before = [&first, &second, &third].map(|path| {
+            let metadata = fs::metadata(path).unwrap();
+            (
+                fs::read(path).unwrap(),
+                metadata.modified().unwrap(),
+                metadata.permissions().mode(),
+                metadata.nlink(),
+            )
+        });
+        let listed = log.list().unwrap();
+        assert_eq!(
+            listed
+                .entries()
+                .iter()
+                .map(|entry| (
+                    entry.session_id(),
+                    entry.created_at_unix_ms(),
+                    entry.status(),
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                (SESSION, Some(900), ListedSessionStatus::Completed),
+                (SECOND_SESSION, Some(900), ListedSessionStatus::Completed,),
+                (THIRD_SESSION, Some(100), ListedSessionStatus::Completed,),
+            ]
+        );
+        assert!(listed.entries()[1].has_trailing_fragment());
+        let after = [&first, &second, &third].map(|path| {
+            let metadata = fs::metadata(path).unwrap();
+            (
+                fs::read(path).unwrap(),
+                metadata.modified().unwrap(),
+                metadata.permissions().mode(),
+                metadata.nlink(),
+            )
+        });
+        assert_eq!(after, before);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_list_maps_unhealthy_neighbors_without_mutation() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
+
+        fn write_private(path: &Path, bytes: &[u8]) {
+            fs::write(path, bytes).unwrap();
+            fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+
+        let corrupt = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let unsupported = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let symlinked = "cccccccccccccccccccccccccccccccc";
+        let hard_linked = "dddddddddddddddddddddddddddddddd";
+        let non_regular = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+        let wrong_permissions = "ffffffffffffffffffffffffffffffff";
+        let root = TempRoot::new("list-unhealthy");
+        let mut log = SessionLog::fixed_file(
+            root.0.clone(),
+            &[
+                SECOND_SESSION,
+                SECOND_OPERATION,
+                SECOND_USER,
+                SECOND_TERMINAL,
+                SESSION,
+                OPERATION,
+                USER,
+            ],
+            &[500, 501, 502, 600, 601],
+            None,
+        );
+        log.start("valid-neighbor-prompt")
+            .unwrap()
+            .append_assistant("valid-neighbor-answer")
+            .unwrap();
+        let busy_writer = log.start("busy-neighbor-prompt").unwrap();
+        let sessions = root.0.join("sessions");
+
+        let corrupt_path = sessions.join(format!("{corrupt}.jsonl"));
+        write_private(&corrupt_path, b"corrupt-private-sentinel\n");
+        let unsupported_path = sessions.join(format!("{unsupported}.jsonl"));
+        write_private(
+            &unsupported_path,
+            format!(
+                "{{\"record_type\":\"session_header\",\"format_version\":2,\"session_id\":\"{unsupported}\",\"created_at_unix_ms\":999,\"working_directory\":null,\"harness_version\":\"0.1.0\"}}\n"
+            )
+            .as_bytes(),
+        );
+        let target = root.0.join("link-target");
+        write_private(&target, b"link-target-sentinel");
+        symlink(&target, sessions.join(format!("{symlinked}.jsonl"))).unwrap();
+        let hard_target = root.0.join("hard-target");
+        write_private(&hard_target, b"hard-link-target-sentinel");
+        fs::hard_link(&hard_target, sessions.join(format!("{hard_linked}.jsonl"))).unwrap();
+        fs::create_dir(sessions.join(format!("{non_regular}.jsonl"))).unwrap();
+        let wrong_path = sessions.join(format!("{wrong_permissions}.jsonl"));
+        fs::write(&wrong_path, b"wrong-permission-sentinel").unwrap();
+        fs::set_permissions(&wrong_path, fs::Permissions::from_mode(0o644)).unwrap();
+        let ignored = sessions.join("not-a-session.jsonl");
+        fs::write(&ignored, b"ignored-noncanonical-sentinel").unwrap();
+        fs::set_permissions(&ignored, fs::Permissions::from_mode(0o600)).unwrap();
+
+        let regular_paths = [
+            sessions.join(format!("{SECOND_SESSION}.jsonl")),
+            sessions.join(format!("{SESSION}.jsonl")),
+            corrupt_path,
+            unsupported_path,
+            target.clone(),
+            hard_target.clone(),
+            wrong_path,
+            ignored,
+        ];
+        let before = regular_paths
+            .iter()
+            .map(|path| {
+                let metadata = fs::metadata(path).unwrap();
+                (
+                    fs::read(path).unwrap(),
+                    metadata.modified().unwrap(),
+                    metadata.permissions().mode(),
+                    metadata.nlink(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let listed = log.list().unwrap();
+        assert_eq!(listed.entries().len(), 8);
+        assert_eq!(listed.entries()[0].session_id(), SECOND_SESSION);
+        assert_eq!(listed.entries()[0].status(), ListedSessionStatus::Completed);
+        assert_eq!(listed.entries()[1].session_id(), SESSION);
+        assert_eq!(listed.entries()[1].status(), ListedSessionStatus::Busy);
+        for (entry, expected_id, expected_status) in [
+            (&listed.entries()[2], corrupt, ListedSessionStatus::Corrupt),
+            (
+                &listed.entries()[3],
+                unsupported,
+                ListedSessionStatus::Unsupported,
+            ),
+            (
+                &listed.entries()[4],
+                symlinked,
+                ListedSessionStatus::Unavailable,
+            ),
+            (
+                &listed.entries()[5],
+                hard_linked,
+                ListedSessionStatus::Unavailable,
+            ),
+            (
+                &listed.entries()[6],
+                non_regular,
+                ListedSessionStatus::Unavailable,
+            ),
+            (
+                &listed.entries()[7],
+                wrong_permissions,
+                ListedSessionStatus::Unavailable,
+            ),
+        ] {
+            assert_eq!(entry.session_id(), expected_id);
+            assert_eq!(entry.status(), expected_status);
+            assert_eq!(entry.created_at_unix_ms(), None);
+        }
+        let after = regular_paths
+            .iter()
+            .map(|path| {
+                let metadata = fs::metadata(path).unwrap();
+                (
+                    fs::read(path).unwrap(),
+                    metadata.modified().unwrap(),
+                    metadata.permissions().mode(),
+                    metadata.nlink(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(after, before);
+        assert_eq!(
+            fs::read_link(sessions.join(format!("{symlinked}.jsonl"))).unwrap(),
+            target
+        );
+        assert!(sessions.join(format!("{non_regular}.jsonl")).is_dir());
+        drop(busy_writer);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_list_enforces_locked_aggregate_budget_before_the_next_read() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = TempRoot::new("list-aggregate");
+        let mut log = SessionLog::fixed_file(
+            root.0.clone(),
+            &[
+                SESSION,
+                OPERATION,
+                USER,
+                TERMINAL,
+                SECOND_SESSION,
+                SECOND_OPERATION,
+                SECOND_USER,
+                SECOND_TERMINAL,
+            ],
+            &[100, 101, 102, 200, 201, 202],
+            None,
+        );
+        log.start("first")
+            .unwrap()
+            .append_assistant("answer-one")
+            .unwrap();
+        log.start("second")
+            .unwrap()
+            .append_assistant("answer-two")
+            .unwrap();
+        let sessions = root.0.join("sessions");
+        let first = sessions.join(format!("{SESSION}.jsonl"));
+        let second = sessions.join(format!("{SECOND_SESSION}.jsonl"));
+        let exact = fs::metadata(&first).unwrap().len() + fs::metadata(&second).unwrap().len();
+        let before = [fs::read(&first).unwrap(), fs::read(&second).unwrap()];
+        let limits = ListLimits {
+            read_bytes: exact,
+            ..LIST_LIMITS
+        };
+        assert_eq!(log.list_with_limits(limits).unwrap().entries().len(), 2);
+        assert_eq!(
+            log.list_with_limits(ListLimits {
+                read_bytes: exact - 1,
+                ..LIST_LIMITS
+            }),
+            Err(ListError::InventoryTooLarge)
+        );
+        assert_eq!(
+            [fs::read(&first).unwrap(), fs::read(&second).unwrap()],
+            before
+        );
+
+        let oversized_id = "ffffffffffffffffffffffffffffffff";
+        let oversized_path = sessions.join(format!("{oversized_id}.jsonl"));
+        fs::write(&oversized_path, vec![b'x'; MAX_SESSION_BYTES + 1]).unwrap();
+        fs::set_permissions(&oversized_path, fs::Permissions::from_mode(0o600)).unwrap();
+        let listed = log.list_with_limits(limits).unwrap();
+        assert_eq!(listed.entries().len(), 3);
+        assert_eq!(listed.entries()[2].status(), ListedSessionStatus::Corrupt);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_list_detects_path_replacement_and_maps_read_errors_to_unavailable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = TempRoot::new("list-races");
+        let mut log = SessionLog::fixed_file(
+            root.0.clone(),
+            &[SESSION, OPERATION, USER, TERMINAL],
+            &[100, 101, 102],
+            None,
+        );
+        log.start("prompt")
+            .unwrap()
+            .append_assistant("answer")
+            .unwrap();
+        let path = root.0.join("sessions").join(format!("{SESSION}.jsonl"));
+        let displaced = root.0.join("sessions/displaced.jsonl");
+        let original = fs::read(&path).unwrap();
+        let replacement = b"replacement-race-sentinel";
+        let mut budget = ListReadBudget {
+            used: 0,
+            limit: MAX_LIST_READ_BYTES,
+        };
+        let result = inspect_file_with_hook(
+            &path,
+            SESSION,
+            ReadPolicy::List(&mut budget),
+            |_, canonical| {
+                fs::rename(canonical, &displaced).unwrap();
+                fs::write(canonical, replacement).unwrap();
+                fs::set_permissions(canonical, fs::Permissions::from_mode(0o600)).unwrap();
+            },
+        );
+        assert!(matches!(
+            result,
+            Err(FileInspectionError::Show(ShowError::Corrupt))
+        ));
+        assert_eq!(fs::read(&displaced).unwrap(), original);
+        assert_eq!(fs::read(&path).unwrap(), replacement);
+
+        struct FailingReader;
+
+        impl Read for FailingReader {
+            fn read(&mut self, _buffer: &mut [u8]) -> io::Result<usize> {
+                Err(io::Error::other("injected read failure"))
+            }
+        }
+
+        let error = read_captured_bytes(&mut FailingReader, 1).unwrap_err();
+        assert_eq!(error, ShowError::StoreUnavailable);
+        let listed = summarize_candidates(vec![SESSION.to_owned()], |_| {
+            Err(FileInspectionError::Show(error))
+        })
+        .unwrap();
+        assert_eq!(listed.entries().len(), 1);
+        assert_eq!(
+            listed.entries()[0].status(),
+            ListedSessionStatus::Unavailable
+        );
     }
 
     #[cfg(unix)]

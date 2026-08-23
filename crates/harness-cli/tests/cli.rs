@@ -46,15 +46,16 @@ const HELP: &str = "A local coding-agent harness
 Usage: harness [OPTIONS] [COMMAND]
 
 Commands:
-  ask    Ask OpenAI Codex one question
-  auth   Manage account authentication
-  model  Exercise model connections
-  session  Inspect a retained session
+  ask      Ask OpenAI Codex one question
+  auth     Manage account authentication
+  model    Exercise model connections
+  session  Inspect retained sessions
 
 Retention:
   Successful and failed valid asks are retained locally by default, including the
   prompt, answer or fixed failure, timestamps, and working directory when available.
-  Files remain until manually removed from:
+  Use session list to recover retained identifiers. Files remain until manually
+  removed; there is no opt-out, delete, retention, or automatic-cleanup command.
   macOS: ~/Library/Application Support/rust-agent-harness/sessions/
   Linux: $XDG_DATA_HOME/rust-agent-harness/sessions/ or
          ~/.local/share/rust-agent-harness/sessions/
@@ -142,8 +143,8 @@ Output:
 Retention:
   Successful and failed valid asks are retained locally by default, including the
   prompt, answer or fixed failure, timestamps, and working directory when available.
-  The stderr Session line is the only CLI handle. Files remain until manually removed;
-  there is no opt-out, list, delete, retention, or automatic-cleanup command.
+  Use session list to recover retained identifiers. Files remain until manually
+  removed; there is no opt-out, delete, retention, or automatic-cleanup command.
   macOS: ~/Library/Application Support/rust-agent-harness/sessions/
   Linux: $XDG_DATA_HOME/rust-agent-harness/sessions/ or
          ~/.local/share/rust-agent-harness/sessions/
@@ -151,21 +152,37 @@ Retention:
 Options:
   -h, --help  Print help
 ";
-const SESSION_HELP: &str = "Inspect a retained session
+const SESSION_HELP: &str = "Inspect retained sessions
 
 Usage: harness session [OPTIONS] [COMMAND]
 
 Commands:
+  list  List retained sessions
   show  Show one retained session by identifier
 
 Retention:
   Successful and failed valid asks are retained locally by default, including the
   prompt, answer or fixed failure, timestamps, and working directory when available.
-  The stderr Session line is the only CLI handle. Files remain until manually removed;
-  there is no opt-out, list, delete, retention, or automatic-cleanup command.
+  Use session list to recover retained identifiers. Files remain until manually
+  removed; there is no opt-out, delete, retention, or automatic-cleanup command.
   macOS: ~/Library/Application Support/rust-agent-harness/sessions/
   Linux: $XDG_DATA_HOME/rust-agent-harness/sessions/ or
          ~/.local/share/rust-agent-harness/sessions/
+
+Options:
+  -h, --help  Print help
+";
+const SESSION_LIST_HELP: &str = "List retained sessions
+
+Usage: harness session list [OPTIONS]
+
+Output:
+  Metadata only: session identifier, creation time in Unix milliseconds, and status
+  Newest created sessions appear first
+
+Limits:
+  At most 4096 directory entries, 4096 session files, and 67108864 aggregate bytes
+  are inspected
 
 Options:
   -h, --help  Print help
@@ -275,6 +292,13 @@ fn nested_help_is_available_and_terminal() {
     assert!(output.status.success());
     assert_eq!(String::from_utf8_lossy(&output.stdout), SESSION_SHOW_HELP);
     assert!(output.stderr.is_empty());
+
+    for flag in ["-h", "--help"] {
+        let output = run(&["session", "list", flag]);
+        assert!(output.status.success());
+        assert_eq!(String::from_utf8_lossy(&output.stdout), SESSION_LIST_HELP);
+        assert!(output.stderr.is_empty());
+    }
 
     for arguments in [
         &["auth", "login"][..],
@@ -407,6 +431,16 @@ fn invalid_command_shapes_print_bounded_usage_diagnostics() {
             "harness session [OPTIONS] [COMMAND]",
         ),
         (
+            &["session", "list", "extra"][..],
+            "extra",
+            "harness session list [OPTIONS]",
+        ),
+        (
+            &["session", "list", "--help", "extra"][..],
+            "extra",
+            "harness session list [OPTIONS]",
+        ),
+        (
             &["session", "show"][..],
             "<SESSION_ID>",
             "harness session show [OPTIONS] <SESSION_ID>",
@@ -518,6 +552,7 @@ fn double_dash_is_reported_as_invalid_at_each_level() {
         &["ask", "--"][..],
         &["ask", "openai-codex", "--"][..],
         &["session", "--"][..],
+        &["session", "list", "--"][..],
         &["session", "show", "--"][..],
     ] {
         let output = run(arguments);
@@ -600,6 +635,19 @@ fn non_utf8_argument_prints_a_diagnostic() {
         String::from_utf8_lossy(&output.stderr),
         "error: unexpected argument '�'\n\nUsage: harness session show [OPTIONS] <SESSION_ID>\n\nFor more information, try '--help'.\n"
     );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_harness"))
+        .args(["session", "list"])
+        .arg(OsString::from_vec(vec![0xff]))
+        .output()
+        .expect("harness should run");
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr),
+        "error: unexpected argument '�'\n\nUsage: harness session list [OPTIONS]\n\nFor more information, try '--help'.\n"
+    );
 }
 
 #[cfg(unix)]
@@ -650,6 +698,13 @@ fn closed_output_streams_do_not_panic() {
         .expect("harness should run");
     assert!(session_help.success());
 
+    let session_list_help = Command::new(env!("CARGO_BIN_EXE_harness"))
+        .args(["session", "list", "--help"])
+        .stdout(closed_stream())
+        .status()
+        .expect("harness should run");
+    assert!(session_list_help.success());
+
     let status_help = Command::new(env!("CARGO_BIN_EXE_harness"))
         .args(["auth", "status", "--help"])
         .stdout(closed_stream())
@@ -663,6 +718,23 @@ fn closed_output_streams_do_not_panic() {
         .status()
         .expect("harness should run");
     assert!(logout_help.success());
+}
+
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn production_empty_session_list_is_isolated_and_creates_nothing() {
+    let root = TempRoot::new("empty-list");
+    let output = root
+        .command()
+        .args(["session", "list"])
+        .output()
+        .expect("harness should run");
+
+    assert!(output.status.success());
+    assert_eq!(output.stdout, b"No retained sessions.\n");
+    assert!(output.stderr.is_empty());
+    assert!(!root.0.join("home").exists());
+    assert!(!root.0.join("xdg").exists());
 }
 
 #[test]
