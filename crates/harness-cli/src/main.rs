@@ -983,6 +983,7 @@ fn complete(completion: Completion) -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
     use std::cell::RefCell;
     use std::rc::Rc;
 
@@ -997,6 +998,21 @@ mod tests {
     const PLAN: &str = "plan-sentinel";
     const EXPIRY: &str = "expiry-sentinel";
     const SESSION_ID: &str = "11111111111111111111111111111111";
+
+    proptest! {
+        #[test]
+        fn fuzz_terminal_renderer_never_emits_raw_controls(input in any::<String>()) {
+            let rendered = render_model_text(&input);
+            prop_assert!(rendered.ends_with('\n'));
+            prop_assert!(rendered.len() <= input.len().saturating_mul(6).saturating_add(1));
+            let contains_only_safe_characters = rendered.chars().all(|character| {
+                character == '\n'
+                    || character == '\t'
+                    || (!character.is_control() && !is_bidi_control(character))
+            });
+            prop_assert!(contains_only_safe_characters);
+        }
+    }
 
     struct FakeLogin {
         result: Result<ConnectedAccount, LoginError>,
