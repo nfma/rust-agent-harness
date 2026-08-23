@@ -5,7 +5,7 @@ use std::fmt::Write as _;
 use std::time::{Duration, Instant};
 
 use harness_openai_codex_auth::{AuthorizedCredential, CredentialUseError};
-use rand::{RngCore, rngs::OsRng};
+use rand::{TryRng, rngs::SysRng};
 use reqwest::StatusCode;
 use reqwest::blocking::{Client, RequestBuilder};
 use reqwest::header::{ACCEPT, CONTENT_TYPE, USER_AGENT};
@@ -147,7 +147,9 @@ struct RandomCorrelationIds;
 impl CorrelationIds for RandomCorrelationIds {
     fn next(&mut self) -> String {
         let mut random = [0u8; 16];
-        OsRng.fill_bytes(&mut random);
+        SysRng
+            .try_fill_bytes(&mut random)
+            .expect("system random number generator unavailable");
         let mut id = String::with_capacity(random.len() * 2);
         for byte in random {
             write!(id, "{byte:02x}").expect("writing to a String cannot fail");
